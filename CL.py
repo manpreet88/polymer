@@ -1,7 +1,3 @@
-# multimodal_pretrain_streaming.py
-# Full single-file multimodal pretraining pipeline with streaming/lazy dataset to avoid OOM.
-# Preserves all hyperparameters and training arguments from your original script.
-
 import os
 import sys
 import csv
