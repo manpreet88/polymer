@@ -1162,36 +1162,6 @@ multimodal_model = MultimodalContrastiveModel(gine_encoder, schnet_encoder, fp_e
 multimodal_model.to(device)
 
 # ---------------------------
-# FREEZE ENCODERS: only train projection heads
-# (This is the requested change: encoders frozen; projection heads left trainable)
-if getattr(multimodal_model, "gine", None) is not None:
-    for p in multimodal_model.gine.parameters():
-        p.requires_grad = False
-if getattr(multimodal_model, "schnet", None) is not None:
-    for p in multimodal_model.schnet.parameters():
-        p.requires_grad = False
-if getattr(multimodal_model, "fp", None) is not None:
-    for p in multimodal_model.fp.parameters():
-        p.requires_grad = False
-if getattr(multimodal_model, "psmiles", None) is not None:
-    for p in multimodal_model.psmiles.parameters():
-        p.requires_grad = False
-
-# Ensure projection heads remain trainable (they should be by default)
-if getattr(multimodal_model, "proj_gine", None) is not None:
-    for p in multimodal_model.proj_gine.parameters():
-        p.requires_grad = True
-if getattr(multimodal_model, "proj_schnet", None) is not None:
-    for p in multimodal_model.proj_schnet.parameters():
-        p.requires_grad = True
-if getattr(multimodal_model, "proj_fp", None) is not None:
-    for p in multimodal_model.proj_fp.parameters():
-        p.requires_grad = True
-if getattr(multimodal_model, "proj_psmiles", None) is not None:
-    for p in multimodal_model.proj_psmiles.parameters():
-        p.requires_grad = True
-
-# ---------------------------
 # Helper to sample masked variant for modalities: (kept same, device-safe)
 def mask_batch_for_modality(batch: dict, modality: str, p_mask: float = P_MASK):
     b = {}
@@ -1761,8 +1731,7 @@ trainer.get_eval_dataloader  = lambda eval_dataset=None: val_loader
 training_args.metric_for_best_model = "eval_loss"
 training_args.greater_is_better = False
 
-# Build optimizer only for trainable params (projection heads) to be explicit
-optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, multimodal_model.parameters()), lr=training_args.learning_rate, weight_decay=training_args.weight_decay)
+optimizer = torch.optim.AdamW(multimodal_model.parameters(), lr=training_args.learning_rate, weight_decay=training_args.weight_decay)
 
 total_params = sum(p.numel() for p in multimodal_model.parameters())
 trainable_params = sum(p.numel() for p in multimodal_model.parameters() if p.requires_grad)
