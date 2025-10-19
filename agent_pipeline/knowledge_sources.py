@@ -89,7 +89,10 @@ class CSVKnowledgeSource(PolymerKnowledgeSource):
                 value = row.get(column)
                 if pd.isna(value):
                     continue
-                properties[column[len(self.properties_prefix) :]] = float(value)
+                try:
+                    properties[column[len(self.properties_prefix) :]] = float(value)
+                except (TypeError, ValueError):
+                    continue
             extra_metadata: Dict[str, object] = {}
             for column in df.columns:
                 if column in {"psmiles", self.source_column, self.tags_column}:
