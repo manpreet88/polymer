@@ -336,13 +336,74 @@ def _adapt_state_dict(module: torch.nn.Module, state: object) -> object:
 def load_tokenizer(psmiles_dir: Path) -> Tuple[object, int]:
     """Load the tokenizer packaged with the PSMILES encoder if possible."""
 
+    sp_path = psmiles_dir / "tokenizer.model"
+    if sp_path.exists() and spm is not None:
+        try:
+            processor = spm.SentencePieceProcessor()
+            processor.Load(str(sp_path))
+
+            class SentencePieceTokenizer:
+                def __init__(self, proc: spm.SentencePieceProcessor) -> None:
+                    self._processor = proc
+                    self.mask_token = "<mask>"
+                    self.pad_token = "<pad>"
+                    self.cls_token = "<cls>"
+                    self.sep_token = "<sep>"
+                    self.unk_token = "<unk>"
+                    self.max_len = 128
+
+                    self.mask_token_id = self._resolve_token_id(self.mask_token)
+                    self.pad_token_id = self._resolve_token_id(self.pad_token)
+                    self.cls_token_id = self._resolve_token_id(self.cls_token)
+                    self.sep_token_id = self._resolve_token_id(self.sep_token)
+                    self.unk_token_id = self._resolve_token_id(self.unk_token)
+
+                def _resolve_token_id(self, token: str) -> int:
+                    idx = self._processor.PieceToId(token)
+                    if idx < 0:
+                        idx = self._processor.unk_id()
+                    return int(idx)
+
+                def __len__(self) -> int:
+                    return self._processor.GetPieceSize()
+
+                def __call__(
+                    self,
+                    text: str,
+                    *,
+                    truncation: bool = True,
+                    padding: str = "max_length",
+                    max_length: Optional[int] = None,
+                ) -> Dict[str, Sequence[int]]:
+                    max_len = max_length or getattr(self, "max_len", 128)
+                    ids = list(self._processor.EncodeAsIds(text))
+                    if truncation:
+                        ids = ids[:max_len]
+                    attention = [1] * len(ids)
+                    if padding == "max_length" and len(ids) < max_len:
+                        pad_id = self.pad_token_id
+                        pad_len = max_len - len(ids)
+                        ids = ids + [pad_id] * pad_len
+                        attention = attention + [0] * pad_len
+                    return {"input_ids": ids, "attention_mask": attention}
+
+            tokenizer = SentencePieceTokenizer(processor)
+            tokenizer.model_max_length = getattr(tokenizer, "max_len", 128)
+            LOGGER.info("Loaded SentencePiece tokenizer from %s", sp_path)
+            print(f"Loaded tokenizer from {sp_path}")
+            return tokenizer, len(tokenizer)
+        except Exception as exc:  # pragma: no cover - safety fallback
+            LOGGER.warning("Failed to load SentencePiece tokenizer: %s", exc)
+    elif sp_path.exists():
+        LOGGER.info("SentencePiece package not available; attempting Hugging Face tokenizer load")
+
     if DebertaV2Tokenizer is not None:
         try:
             tokenizer_path: Optional[Path] = None
             if (psmiles_dir / "tokenizer.json").exists():
                 tokenizer_path = psmiles_dir
-            elif (psmiles_dir / "tokenizer.model").exists():
-                tokenizer_path = psmiles_dir / "tokenizer.model"
+            elif sp_path.exists():
+                tokenizer_path = sp_path
             if tokenizer_path is not None:
                 if (
                     isinstance(tokenizer_path, Path)
@@ -362,6 +423,8 @@ def load_tokenizer(psmiles_dir: Path) -> Tuple[object, int]:
             else:
                 tokenizer = DebertaV2Tokenizer.from_pretrained("microsoft/deberta-v2-xlarge")
             tokenizer.add_special_tokens({"pad_token": "<pad>", "mask_token": "<mask>"})
+            LOGGER.info("Loaded fallback Hugging Face tokenizer")
+            print("Loaded fallback Hugging Face tokenizer")
             return tokenizer, len(tokenizer)
         except Exception as exc:  # pragma: no cover - fallback path
             LOGGER.warning("Falling back to simple tokenizer because HF tokenizer failed: %s", exc)
@@ -444,7 +507,7 @@ def load_multimodal_model(
 
     try:
         gine = GineEncoder()
-        _load_state_dict(gine, checkpoints.gine_dir / "pytorch_model.bin")
+        load_checkpoint_state(gine, checkpoints.gine_dir / "pytorch_model.bin")
     except Exception as exc:
         LOGGER.warning("Unable to initialize GINE encoder: %s", exc)
         if require_pretrained:
@@ -452,7 +515,7 @@ def load_multimodal_model(
 
     try:
         schnet = NodeSchNetWrapper()
-        _load_state_dict(schnet, checkpoints.schnet_dir / "pytorch_model.bin")
+        load_checkpoint_state(schnet, checkpoints.schnet_dir / "pytorch_model.bin")
     except Exception as exc:
         LOGGER.warning("Unable to initialize SchNet encoder: %s", exc)
         if require_pretrained:
@@ -460,7 +523,7 @@ def load_multimodal_model(
 
     try:
         fp = FingerprintEncoder()
-        _load_state_dict(fp, checkpoints.fingerprint_dir / "pytorch_model.bin")
+        load_checkpoint_state(fp, checkpoints.fingerprint_dir / "pytorch_model.bin")
     except Exception as exc:
         LOGGER.warning("Unable to initialize fingerprint encoder: %s", exc)
         if require_pretrained:
@@ -468,7 +531,7 @@ def load_multimodal_model(
 
     try:
         psmiles = PSMILESDebertaEncoder(checkpoints.psmiles_dir, tokenizer_vocab_size=vocab_size)
-        _load_state_dict(psmiles, checkpoints.psmiles_dir / "pytorch_model.bin")
+        load_checkpoint_state(psmiles, checkpoints.psmiles_dir / "pytorch_model.bin")
     except Exception as exc:
         LOGGER.warning("Unable to initialize PSMILES encoder: %s", exc)
         if require_pretrained:
@@ -476,7 +539,7 @@ def load_multimodal_model(
 
     model = MultimodalContrastiveModel(gine, schnet, fp, psmiles)
     mm_path = checkpoints.multimodal_dir / "pytorch_model.bin"
-    _load_state_dict(model, mm_path)
+    load_checkpoint_state(model, mm_path)
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
