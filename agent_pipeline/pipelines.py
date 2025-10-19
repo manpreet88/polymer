@@ -123,11 +123,7 @@ def run_non_expert_walkthrough(
 
     polymer = services.ingestion.ingest_psmiles(psmiles, source="non_expert")
     embedding = services.embedding.embed_polymer(polymer)
-    predictions = services.predictor.predict_from_embedding(
-        embedding, psmiles=polymer.psmiles
-    )
-    if not predictions:
-        predictions = services.predictor.predict_polymer(polymer)
+    predictions = services.predictor.predict_from_embedding(embedding)
     if property_focus:
         predictions = [pred for pred in predictions if pred.name in set(property_focus)]
     neighbours_found = services.knowledge_base.search(embedding.vector, top_k=neighbours)
