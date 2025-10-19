@@ -554,4 +554,4 @@ def load_multimodal_model(
     return model, tokenizer
 
 
-__all__ = ["load_multimodal_model", "load_tokenizer"]
+__all__ = ["load_checkpoint_state", "load_multimodal_model", "load_tokenizer"]
