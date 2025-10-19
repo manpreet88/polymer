@@ -154,6 +154,21 @@ The command prints the canonicalised structure, nearest neighbours stored in the
 - `examples/high_level_scenarios.py` mirrors the oncology-agent paper with two personas:
   - **Non-expert triage** – a technician provides a rough PSMILES and immediately receives property predictions plus nearest neighbours retrieved from PoLyInfo/Polymer Genome/MatWeb references.
   - **Expert design studio** – a polymer chemist explores targeted candidates with automated retrieval, generator-driven mutations, quantitative scoring, and RDKit visualisations saved to `visualisations/`.
+- `examples/paper_casebook.py` reproduces the detailed casebook flow described in the oncology agent publication, but adapted to polymers. It stages four contrasting personas (lab technician, process engineer, sustainability analyst, additive manufacturing specialist) and, for each:
+  1. Normalises the provided PSMILES and embeds it with the multimodal encoder.
+  2. Runs property predictions filtered to the persona’s objectives.
+  3. Retrieves similar entries from the knowledge base.
+  4. Optionally generates improved candidates and scores them.
+  5. Calls the web RAG tool for external evidence.
+  6. Synthesises a persona-aware Markdown report and saves any generated figures.
+
+  Execute the casebook end-to-end with:
+
+  ```bash
+  python examples/paper_casebook.py
+  ```
+
+  The script resolves checkpoint and knowledge-base directories using `CheckpointConfig().resolve()` and `KnowledgeBaseConfig().resolve()`. Set the corresponding environment variables or edit `agent_pipeline/config.py` if your artefacts live elsewhere. On first run, it seeds the knowledge base from `examples/data/polymer_reference.csv` when available and prints a JSON summary for each scenario alongside the report markdown path. Ensure your OpenAI credentials are configured (see **GPT-4 access**) so the web RAG and report writer can call GPT-4.
 
 Both scripts load a curated catalog located at `examples/data/polymer_reference.csv`. Replace this file with richer exports (PoLyInfo CSV, Polymer Genome JSONL, MatWeb scrapes, Polymer Handbook tables) to ground the knowledge base in authoritative sources. Use:
 
