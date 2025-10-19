@@ -170,37 +170,9 @@ def _candidate_checkpoint_paths(base_path: Path) -> Iterable[Path]:
     yield base_path
     if base_path.suffix:
         yield base_path.with_suffix(".safetensors")
-
-    parent_dirs = {base_path.parent}
-    if base_path.parent.name == "best":
-        parent_dirs.add(base_path.parent.parent)
-
-    if base_path.is_dir():
-        parent_dirs.add(base_path)
-
-    candidate_names = (
-        base_path.name,
-        "pytorch_model.bin",
-        "pytorch_model.pt",
-        "pytorch_model.pth",
-        "model.safetensors",
-        "model.pt",
-        "model.bin",
-        "model.pth",
-        "weights.pt",
-        "checkpoint.pt",
-        "checkpoint.pth",
-        "best_model.pth",
-        "best_model.pt",
-        "best_model.bin",
-        "best.ckpt",
-    )
-
-    for directory in parent_dirs:
-        for name in candidate_names:
-            if not name:
-                continue
-            yield directory / name
+    parent = base_path.parent
+    for name in ("model.safetensors", "model.pt", "model.bin", "pytorch_model.bin"):
+        yield parent / name
 
 
 def load_checkpoint_state(module: torch.nn.Module, checkpoint_path: Path) -> Tuple[Sequence[str], Sequence[str]]:
@@ -216,8 +188,6 @@ def load_checkpoint_state(module: torch.nn.Module, checkpoint_path: Path) -> Tup
 
     for candidate in dict.fromkeys(_candidate_checkpoint_paths(checkpoint_path)):
         if not candidate.exists():
-            continue
-        if candidate.is_dir():
             continue
         try:
             if candidate.suffix == ".safetensors":
