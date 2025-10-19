@@ -14,6 +14,7 @@ from .knowledge_sources import (
     read_reference_catalog,
 )
 from .property_predictor import PropertyPredictorEnsemble
+from .casebook import CaseSpec, CaseOutcome, CasebookRunner
 from .generation import PolymerGeneratorTool
 from .orchestrator import GPT4Orchestrator, ToolRegistry
 from .ui_cli import launch_cli
@@ -43,6 +44,9 @@ __all__ = [
     "PolymerGeneratorTool",
     "GPT4Orchestrator",
     "ToolRegistry",
+    "CaseSpec",
+    "CaseOutcome",
+    "CasebookRunner",
     "PipelineServices",
     "build_pipeline_services",
     "seed_knowledge_base_from_catalog",
