@@ -145,6 +145,7 @@ class NodeSchNetWrapper(nn.Module):
             raise RuntimeError("torch_geometric is required for SchNet inference.")
         self.schnet = PyGSchNet(
             hidden_channels=SCHNET_HIDDEN,
+            num_filters=SCHNET_HIDDEN,
             num_interactions=SCHNET_NUM_INTERACTIONS,
             num_gaussians=SCHNET_NUM_GAUSSIANS,
             cutoff=SCHNET_CUTOFF,
