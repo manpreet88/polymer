@@ -230,6 +230,7 @@ def load_checkpoint_state(module: torch.nn.Module, checkpoint_path: Path) -> Tup
         raise FileNotFoundError(f"No checkpoint found at {checkpoint_path}")
 
     LOGGER.info("Loaded checkpoint weights from %s", used_path)
+    print(f"Loaded checkpoint weights from {used_path}")
 
     state = _unwrap_state_dict(state)
     state = _adapt_state_dict(module, state)
@@ -242,6 +243,7 @@ def load_checkpoint_state(module: torch.nn.Module, checkpoint_path: Path) -> Tup
         LOGGER.warning("Unexpected keys for %s: %s", module.__class__.__name__, unexpected)
     if not missing and not unexpected:
         LOGGER.info("All weights loaded for %s", module.__class__.__name__)
+        print(f"Successfully loaded weights for {module.__class__.__name__}")
 
     return missing, unexpected
 
