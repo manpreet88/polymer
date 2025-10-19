@@ -1,5 +1,0 @@
-name,psmiles,source,reference,url,description,tags,property:glass_transition_c,property:melting_point_c,property:density_g_cm3
-Poly(ethylene terephthalate),[*]OC(=O)c1ccc(cc1)C(=O)OCC[*],PoLyInfo,PoLyInfo Record 2465,https://polymer.nims.go.jp/en/detail/2465.html,Commodity polyester used in fibers and packaging,thermoplastic|barrier,75,255,1.38
-Poly(vinylidene fluoride),[*]C(F)(F)C([*])F,Polymer Genome,https://github.com/ram-prasad/PolymerGenome,High-dielectric semi-crystalline fluoropolymer,piezoelectric|electrical,-40,177,1.78
-Poly(ether ether ketone),[*]Oc1ccc(cc1)C(=O)c1ccc(O[*])cc1,MatWeb,MatWeb PEEK Datasheet,https://matweb.com/search/datasheet.aspx?matguid=6c1b23f6d6c0445e92db89eb4ac40a5c,High-temperature aromatic thermoplastic for aerospace,high-performance|thermally-stable,143,343,1.30
-Polyimide (Kapton®),[*]N1C(=O)c2ccc3ccccc3c2C(=O)N([*])1,Polymer Handbook,Polymer Handbook 4th Ed.,https://onlinelibrary.wiley.com/doi/book/10.1002/0471264180,Aromatic polyimide film for extreme environments,high-temperature|aerospace,360,na,1.42
