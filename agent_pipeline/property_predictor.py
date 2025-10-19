@@ -167,6 +167,57 @@ class PropertyPredictorEnsemble:
         embedding = self.embedding_service.embed_polymer(polymer)
         return self.predict_from_embedding(embedding, psmiles=polymer.psmiles)
 
+    def predict(
+        self,
+        polymer: ProcessedPolymer | EmbeddingResult,
+        properties: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Dict[str, float]]:
+        """Convenience wrapper returning a JSON-friendly property dictionary.
+
+        Parameters
+        ----------
+        polymer:
+            Either a fully processed polymer instance or a pre-computed embedding.
+        properties:
+            Optional iterable specifying which properties to include in the
+            returned dictionary. If ``None`` all available predictions are
+            returned.
+        """
+
+        if isinstance(polymer, ProcessedPolymer):
+            predictions = self.predict_polymer(polymer)
+        elif isinstance(polymer, EmbeddingResult):
+            predictions = self.predict_from_embedding(polymer)
+        else:  # pragma: no cover - defensive guard
+            raise TypeError(
+                "polymer must be a ProcessedPolymer or EmbeddingResult; "
+                f"got {type(polymer)!r}"
+            )
+
+        requested: Optional[set[str]] = None
+        if properties is not None:
+            requested = {prop for prop in properties}
+            predictions = [pred for pred in predictions if pred.name in requested]
+
+        result: Dict[str, Dict[str, float]] = {}
+        for pred in predictions:
+            entry: Dict[str, float] = {
+                "mu": float(pred.mean),
+                "sigma": float(pred.std),
+            }
+            if pred.unit is not None:
+                entry["unit"] = pred.unit
+            if pred.raw_outputs:
+                entry["raw_outputs"] = {k: float(v) for k, v in pred.raw_outputs.items()}
+            result[pred.name] = entry
+
+        if requested:
+            missing = requested - set(result)
+            for name in sorted(missing):
+                LOGGER.warning("No property head available for requested property '%s'", name)
+
+        return result
+
     @torch.inference_mode()
     def predict_many(self, polymers: Iterable[ProcessedPolymer]) -> Dict[str, List[PropertyPrediction]]:
         results: Dict[str, List[PropertyPrediction]] = {}
