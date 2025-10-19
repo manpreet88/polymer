@@ -151,6 +151,57 @@ def _candidate_checkpoint_paths(base_path: Path) -> Iterable[Path]:
         yield parent / name
 
 
+def _unwrap_state_dict(state: object) -> object:
+    """Peel common wrappers (Lightning, DistributedDataParallel, etc.)."""
+
+    if not isinstance(state, dict):
+        return state
+    for key in ("state_dict", "model_state_dict", "module", "model"):
+        inner = state.get(key)
+        if isinstance(inner, dict):
+            state = inner
+    if isinstance(state, dict) and all(isinstance(k, str) for k in state.keys()):
+        if any(key.startswith("module.") for key in state):
+            state = {
+                (key[len("module.") :] if key.startswith("module.") else key): value
+                for key, value in state.items()
+            }
+    return state
+
+
+def _harmonize_prefixes(module: torch.nn.Module, state: object) -> object:
+    """Attempt to strip or add prefixes so the state dict matches the module."""
+
+    if not isinstance(state, dict):
+        return state
+
+    param_keys = list(module.state_dict().keys())
+    if not param_keys:
+        return state
+
+    prefix_counts = {}
+    for key in state.keys():
+        for param in param_keys:
+            if key.endswith(param):
+                prefix = key[: -len(param)]
+                prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+                break
+    if prefix_counts:
+        prefix, count = max(prefix_counts.items(), key=lambda item: item[1])
+        if prefix and count >= max(1, len(param_keys) // 2):
+            state = {
+                (key[len(prefix) :] if key.startswith(prefix) else key): value for key, value in state.items()
+            }
+
+    # Some checkpoints omit the "model." prefix for HuggingFace weights.
+    if hasattr(module, "model") and isinstance(module.model, torch.nn.Module):
+        needs_prefix = not any(key.startswith("model.") for key in state)
+        if needs_prefix and any(key.startswith(prefix) for prefix in ("cls.", "deberta.", "encoder.", "embeddings.")):
+            state = {f"model.{key}": value for key, value in state.items()}
+
+    return state
+
+
 def _load_state_dict(module: torch.nn.Module, checkpoint_path: Path) -> Tuple[int, int]:
     """Load a state dict from disk if it exists, returning missing/unexpected counts."""
 
@@ -176,10 +227,8 @@ def _load_state_dict(module: torch.nn.Module, checkpoint_path: Path) -> Tuple[in
         else:
             LOGGER.info("No checkpoint found at %s", checkpoint_path)
         return 0, 0
-
-    LOGGER.debug("Loaded checkpoint for %s from %s", module.__class__.__name__, used_path)
+    state = torch.load(checkpoint_path, map_location="cpu")
     state = _unwrap_state_dict(state)
-    state = _adapt_state_dict(module, state)
     state = _harmonize_prefixes(module, state)
     missing, unexpected = module.load_state_dict(state, strict=False)
     if missing:
