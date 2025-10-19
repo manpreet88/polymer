@@ -201,9 +201,102 @@ def _harmonize_prefixes(module: torch.nn.Module, state: object) -> object:
 
     return state
 
+try:  # pragma: no cover - optional dependency
+    import sentencepiece as spm
+except Exception:  # pragma: no cover - optional dependency
+    spm = None
 
-def _load_state_dict(module: torch.nn.Module, checkpoint_path: Path) -> Tuple[int, int]:
-    """Load a state dict from disk if it exists, returning missing/unexpected counts."""
+try:  # pragma: no cover - optional dependency
+    from safetensors.torch import load_file as load_safetensor
+except Exception:  # pragma: no cover - safetensors is optional
+    load_safetensor = None
+
+
+def _unwrap_state_dict(state: object) -> object:
+    """Peel common wrappers (Lightning, DistributedDataParallel, etc.)."""
+
+    if not isinstance(state, dict):
+        return state
+    for key in ("state_dict", "model_state_dict", "module", "model"):
+        inner = state.get(key)
+        if isinstance(inner, dict):
+            state = inner
+    if isinstance(state, dict) and all(isinstance(k, str) for k in state.keys()):
+        if any(key.startswith("module.") for key in state):
+            state = {
+                (key[len("module.") :] if key.startswith("module.") else key): value
+                for key, value in state.items()
+            }
+    return state
+
+
+def _strip_prefix(state: dict, prefix: str) -> dict:
+    """Remove a common prefix from every key in the state dict."""
+
+    if not any(key.startswith(prefix) for key in state):
+        return state
+    return {key[len(prefix) :] if key.startswith(prefix) else key: value for key, value in state.items()}
+
+
+def _rename_prefix(state: dict, old: str, new: str) -> dict:
+    """Rename a single prefix in the state dict keys if present."""
+
+    if not any(key.startswith(old) for key in state):
+        return state
+    return {
+        (new + key[len(old) :] if key.startswith(old) else key): value for key, value in state.items()
+    }
+
+
+def _module_state_keys(module: torch.nn.Module) -> Sequence[str]:
+    try:
+        return tuple(module.state_dict().keys())
+    except Exception:  # pragma: no cover - safety net for modules without state
+        return ()
+
+
+def _adapt_state_dict(module: torch.nn.Module, state: object) -> object:
+    """Apply heuristic key renames so saved checkpoints line up with runtime modules."""
+
+    if not isinstance(state, dict):
+        return state
+
+    adapted = dict(state)
+
+    if isinstance(module, FingerprintEncoder):
+        adapted = _strip_prefix(adapted, "encoder.")
+        if "mlm_head.weight" in adapted and "token_proj.weight" not in adapted:
+            adapted["token_proj.weight"] = adapted.pop("mlm_head.weight")
+        if "mlm_head.bias" in adapted and "token_proj.bias" not in adapted:
+            adapted["token_proj.bias"] = adapted.pop("mlm_head.bias")
+
+    if isinstance(module, GineEncoder):
+        adapted = _rename_prefix(adapted, "gnn_layers.", "layers.")
+
+    if isinstance(module, NodeSchNetWrapper):
+        expected_keys = _module_state_keys(module)
+        expects_base = any("base_schnet." in key for key in expected_keys)
+        if expects_base:
+            adapted = _rename_prefix(adapted, "schnet.", "schnet.base_schnet.")
+        else:
+            adapted = _rename_prefix(adapted, "schnet.base_schnet.", "schnet.")
+
+    if isinstance(module, MultimodalContrastiveModel):
+        adapted = _rename_prefix(adapted, "gine.gnn_layers.", "gine.layers.")
+        if module.schnet is not None:
+            schnet_expected = _module_state_keys(module.schnet)
+            expects_base = any("base_schnet." in key for key in schnet_expected)
+        else:
+            expects_base = False
+        if expects_base:
+            adapted = _rename_prefix(adapted, "schnet.schnet.", "schnet.schnet.base_schnet.")
+        else:
+            adapted = _rename_prefix(adapted, "schnet.schnet.base_schnet.", "schnet.schnet.")
+        adapted = _rename_prefix(adapted, "fp.encoder.", "fp.")
+        if "fp.mlm_head.weight" in adapted and "fp.token_proj.weight" not in adapted:
+            adapted["fp.token_proj.weight"] = adapted.pop("fp.mlm_head.weight")
+        if "fp.mlm_head.bias" in adapted and "fp.token_proj.bias" not in adapted:
+            adapted["fp.token_proj.bias"] = adapted.pop("fp.mlm_head.bias")
 
     load_error: Optional[Exception] = None
     state: Optional[object] = None
@@ -235,7 +328,9 @@ def _load_state_dict(module: torch.nn.Module, checkpoint_path: Path) -> Tuple[in
         LOGGER.warning("Missing keys for %s: %s", module.__class__.__name__, missing)
     if unexpected:
         LOGGER.warning("Unexpected keys for %s: %s", module.__class__.__name__, unexpected)
-    return len(missing), len(unexpected)
+    if not missing and not unexpected:
+        LOGGER.info("All weights loaded for %s", module.__class__.__name__)
+    return missing, unexpected
 
 
 def load_tokenizer(psmiles_dir: Path) -> Tuple[object, int]:
@@ -243,7 +338,7 @@ def load_tokenizer(psmiles_dir: Path) -> Tuple[object, int]:
 
     if DebertaV2Tokenizer is not None:
         try:
-            tokenizer_path = None
+            tokenizer_path: Optional[Path] = None
             if (psmiles_dir / "tokenizer.json").exists():
                 tokenizer_path = psmiles_dir
             elif (psmiles_dir / "tokenizer.model").exists():
@@ -270,6 +365,63 @@ def load_tokenizer(psmiles_dir: Path) -> Tuple[object, int]:
             return tokenizer, len(tokenizer)
         except Exception as exc:  # pragma: no cover - fallback path
             LOGGER.warning("Falling back to simple tokenizer because HF tokenizer failed: %s", exc)
+    if spm is not None:
+        sp_path = psmiles_dir / "tokenizer.model"
+        if sp_path.exists():
+            try:
+                processor = spm.SentencePieceProcessor()
+                processor.Load(str(sp_path))
+
+                class SentencePieceTokenizer:
+                    def __init__(self, proc: spm.SentencePieceProcessor) -> None:
+                        self._processor = proc
+                        self.mask_token = "<mask>"
+                        self.pad_token = "<pad>"
+                        self.cls_token = "<cls>"
+                        self.sep_token = "<sep>"
+                        self.unk_token = "<unk>"
+                        self.max_len = 128
+
+                        self.mask_token_id = self._resolve_token_id(self.mask_token)
+                        self.pad_token_id = self._resolve_token_id(self.pad_token)
+                        self.cls_token_id = self._resolve_token_id(self.cls_token)
+                        self.sep_token_id = self._resolve_token_id(self.sep_token)
+                        self.unk_token_id = self._resolve_token_id(self.unk_token)
+
+                    def _resolve_token_id(self, token: str) -> int:
+                        idx = self._processor.PieceToId(token)
+                        if idx < 0:
+                            idx = self._processor.unk_id()
+                        return int(idx)
+
+                    def __len__(self) -> int:
+                        return self._processor.GetPieceSize()
+
+                    def __call__(
+                        self,
+                        text: str,
+                        *,
+                        truncation: bool = True,
+                        padding: str = "max_length",
+                        max_length: Optional[int] = None,
+                    ) -> Dict[str, Sequence[int]]:
+                        max_len = max_length or getattr(self, "max_len", 128)
+                        ids = list(self._processor.EncodeAsIds(text))
+                        if truncation:
+                            ids = ids[:max_len]
+                        attention = [1] * len(ids)
+                        if padding == "max_length" and len(ids) < max_len:
+                            pad_id = self.pad_token_id
+                            pad_len = max_len - len(ids)
+                            ids = ids + [pad_id] * pad_len
+                            attention = attention + [0] * pad_len
+                        return {"input_ids": ids, "attention_mask": attention}
+
+                tokenizer = SentencePieceTokenizer(processor)
+                tokenizer.model_max_length = getattr(tokenizer, "max_len", 128)
+                return tokenizer, len(tokenizer)
+            except Exception as exc:  # pragma: no cover - safety fallback
+                LOGGER.warning("Failed to load SentencePiece tokenizer: %s", exc)
     tokenizer = SimplePSMILESTokenizer()
     return tokenizer, len(tokenizer)
 

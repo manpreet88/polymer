@@ -240,15 +240,16 @@ class PSMILESDebertaEncoder(nn.Module):
                 intermediate_size=512,
                 pad_token_id=0,
             )
+        model_loaded = False
         if model_dir is not None and model_dir.exists():
             try:
                 self.model = DebertaV2ForMaskedLM.from_pretrained(str(model_dir))
+                model_loaded = True
             except Exception as exc:  # pragma: no cover - missing weights fallback
-                LOGGER.warning("Failed to load pretrained Deberta weights from %s: %s", model_dir, exc)
-                if config is None:
-                    raise
-                self.model = DebertaV2ForMaskedLM(config)
-        else:
+                LOGGER.warning(
+                    "Failed to load pretrained Deberta weights from %s with from_pretrained: %s", model_dir, exc
+                )
+        if not model_loaded:
             if config is None:
                 raise RuntimeError("transformers is installed but DebertaV2Config is unavailable.")
             self.model = DebertaV2ForMaskedLM(config)
