@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
 
@@ -25,181 +25,6 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # pragma: no cover - fallback if transformers missing
     DebertaV2Tokenizer = None
     PreTrainedTokenizerFast = None
-
-try:  # pragma: no cover - optional dependency
-    from safetensors.torch import load_file as load_safetensor
-except Exception:  # pragma: no cover - safetensors is optional
-    load_safetensor = None
-
-
-def _unwrap_state_dict(state: object) -> object:
-    """Peel common wrappers (Lightning, DistributedDataParallel, etc.)."""
-
-    if not isinstance(state, dict):
-        return state
-    for key in ("state_dict", "model_state_dict", "module", "model"):
-        inner = state.get(key)
-        if isinstance(inner, dict):
-            state = inner
-    if isinstance(state, dict) and all(isinstance(k, str) for k in state.keys()):
-        if any(key.startswith("module.") for key in state):
-            state = {
-                (key[len("module.") :] if key.startswith("module.") else key): value
-                for key, value in state.items()
-            }
-    return state
-
-
-def _strip_prefix(state: dict, prefix: str) -> dict:
-    """Remove a common prefix from every key in the state dict."""
-
-    if not any(key.startswith(prefix) for key in state):
-        return state
-    return {key[len(prefix) :] if key.startswith(prefix) else key: value for key, value in state.items()}
-
-
-def _rename_prefix(state: dict, old: str, new: str) -> dict:
-    """Rename a single prefix in the state dict keys if present."""
-
-    if not any(key.startswith(old) for key in state):
-        return state
-    return {
-        (new + key[len(old) :] if key.startswith(old) else key): value for key, value in state.items()
-    }
-
-
-def _adapt_state_dict(module: torch.nn.Module, state: object) -> object:
-    """Apply heuristic key renames so saved checkpoints line up with runtime modules."""
-
-    if not isinstance(state, dict):
-        return state
-
-    adapted = dict(state)
-
-    if isinstance(module, FingerprintEncoder):
-        adapted = _strip_prefix(adapted, "encoder.")
-        if "mlm_head.weight" in adapted and "token_proj.weight" not in adapted:
-            adapted["token_proj.weight"] = adapted.pop("mlm_head.weight")
-        if "mlm_head.bias" in adapted and "token_proj.bias" not in adapted:
-            adapted["token_proj.bias"] = adapted.pop("mlm_head.bias")
-
-    if isinstance(module, GineEncoder):
-        adapted = _rename_prefix(adapted, "gnn_layers.", "layers.")
-
-    if isinstance(module, NodeSchNetWrapper):
-        adapted = _rename_prefix(adapted, "schnet.base_schnet.", "schnet.")
-
-    if isinstance(module, MultimodalContrastiveModel):
-        adapted = _rename_prefix(adapted, "gine.gnn_layers.", "gine.layers.")
-        adapted = _rename_prefix(adapted, "schnet.schnet.base_schnet.", "schnet.schnet.")
-        adapted = _rename_prefix(adapted, "fp.encoder.", "fp.")
-        if "fp.mlm_head.weight" in adapted and "fp.token_proj.weight" not in adapted:
-            adapted["fp.token_proj.weight"] = adapted.pop("fp.mlm_head.weight")
-        if "fp.mlm_head.bias" in adapted and "fp.token_proj.bias" not in adapted:
-            adapted["fp.token_proj.bias"] = adapted.pop("fp.mlm_head.bias")
-
-        needs_prefix = any(
-            key.startswith(tuple(["cls.", "deberta.", "encoder.", "embeddings."])) for key in adapted
-        ) and not any(key.startswith("model.") for key in adapted)
-        if needs_prefix:
-            adapted = {f"model.{key}": value for key, value in adapted.items()}
-
-    return adapted
-
-
-def _harmonize_prefixes(module: torch.nn.Module, state: object) -> object:
-    """Attempt to strip or add prefixes so the state dict matches the module."""
-
-    if not isinstance(state, dict):
-        return state
-
-    param_keys = list(module.state_dict().keys())
-    if not param_keys:
-        return state
-
-    prefix_counts = {}
-    for key in state.keys():
-        for param in param_keys:
-            if key.endswith(param):
-                prefix = key[: -len(param)]
-                prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
-                break
-    if prefix_counts:
-        prefix, count = max(prefix_counts.items(), key=lambda item: item[1])
-        if prefix and count >= max(1, len(param_keys) // 2):
-            state = {
-                (key[len(prefix) :] if key.startswith(prefix) else key): value for key, value in state.items()
-            }
-
-    # Some checkpoints omit the "model." prefix for HuggingFace weights.
-    if hasattr(module, "model") and isinstance(module.model, torch.nn.Module):
-        needs_prefix = not any(key.startswith("model.") for key in state)
-        if needs_prefix and any(key.startswith(prefix) for prefix in ("cls.", "deberta.", "encoder.", "embeddings.")):
-            state = {f"model.{key}": value for key, value in state.items()}
-
-    return state
-
-
-def _candidate_checkpoint_paths(base_path: Path) -> Iterable[Path]:
-    """Yield plausible filenames for a checkpoint given a preferred path."""
-
-    yield base_path
-    if base_path.suffix:
-        yield base_path.with_suffix(".safetensors")
-    parent = base_path.parent
-    for name in ("model.safetensors", "model.pt", "model.bin", "pytorch_model.bin"):
-        yield parent / name
-
-
-def _unwrap_state_dict(state: object) -> object:
-    """Peel common wrappers (Lightning, DistributedDataParallel, etc.)."""
-
-    if not isinstance(state, dict):
-        return state
-    for key in ("state_dict", "model_state_dict", "module", "model"):
-        inner = state.get(key)
-        if isinstance(inner, dict):
-            state = inner
-    if isinstance(state, dict) and all(isinstance(k, str) for k in state.keys()):
-        if any(key.startswith("module.") for key in state):
-            state = {
-                (key[len("module.") :] if key.startswith("module.") else key): value
-                for key, value in state.items()
-            }
-    return state
-
-
-def _harmonize_prefixes(module: torch.nn.Module, state: object) -> object:
-    """Attempt to strip or add prefixes so the state dict matches the module."""
-
-    if not isinstance(state, dict):
-        return state
-
-    param_keys = list(module.state_dict().keys())
-    if not param_keys:
-        return state
-
-    prefix_counts = {}
-    for key in state.keys():
-        for param in param_keys:
-            if key.endswith(param):
-                prefix = key[: -len(param)]
-                prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
-                break
-    if prefix_counts:
-        prefix, count = max(prefix_counts.items(), key=lambda item: item[1])
-        if prefix and count >= max(1, len(param_keys) // 2):
-            state = {
-                (key[len(prefix) :] if key.startswith(prefix) else key): value for key, value in state.items()
-            }
-
-    # Some checkpoints omit the "model." prefix for HuggingFace weights.
-    if hasattr(module, "model") and isinstance(module.model, torch.nn.Module):
-        needs_prefix = not any(key.startswith("model.") for key in state)
-        if needs_prefix and any(key.startswith(prefix) for prefix in ("cls.", "deberta.", "encoder.", "embeddings.")):
-            state = {f"model.{key}": value for key, value in state.items()}
-
-    return state
 
 try:  # pragma: no cover - optional dependency
     import sentencepiece as spm
@@ -230,7 +55,7 @@ def _unwrap_state_dict(state: object) -> object:
     return state
 
 
-def _strip_prefix(state: dict, prefix: str) -> dict:
+def _strip_prefix(state: Dict[str, torch.Tensor], prefix: str) -> Dict[str, torch.Tensor]:
     """Remove a common prefix from every key in the state dict."""
 
     if not any(key.startswith(prefix) for key in state):
@@ -238,7 +63,7 @@ def _strip_prefix(state: dict, prefix: str) -> dict:
     return {key[len(prefix) :] if key.startswith(prefix) else key: value for key, value in state.items()}
 
 
-def _rename_prefix(state: dict, old: str, new: str) -> dict:
+def _rename_prefix(state: Dict[str, torch.Tensor], old: str, new: str) -> Dict[str, torch.Tensor]:
     """Rename a single prefix in the state dict keys if present."""
 
     if not any(key.startswith(old) for key in state):
@@ -261,7 +86,7 @@ def _adapt_state_dict(module: torch.nn.Module, state: object) -> object:
     if not isinstance(state, dict):
         return state
 
-    adapted = dict(state)
+    adapted: Dict[str, torch.Tensor] = dict(state)
 
     if isinstance(module, FingerprintEncoder):
         adapted = _strip_prefix(adapted, "encoder.")
@@ -298,31 +123,94 @@ def _adapt_state_dict(module: torch.nn.Module, state: object) -> object:
         if "fp.mlm_head.bias" in adapted and "fp.token_proj.bias" not in adapted:
             adapted["fp.token_proj.bias"] = adapted.pop("fp.mlm_head.bias")
 
-    load_error: Optional[Exception] = None
-    state: Optional[object] = None
-    used_path: Optional[Path] = None
-    for candidate in dict.fromkeys(_candidate_checkpoint_paths(checkpoint_path)):
-        if candidate.exists():
-            try:
-                if candidate.suffix == ".safetensors":
-                    if load_safetensor is None:
-                        raise RuntimeError("safetensors support is unavailable")
-                    state = load_safetensor(str(candidate), device="cpu")
-                else:
-                    state = torch.load(candidate, map_location="cpu")
-                used_path = candidate
+    return adapted
+
+
+def _harmonize_prefixes(module: torch.nn.Module, state: object) -> object:
+    """Attempt to strip or add prefixes so the state dict matches the module."""
+
+    if not isinstance(state, dict):
+        return state
+
+    param_keys = list(module.state_dict().keys())
+    if not param_keys:
+        return state
+
+    prefix_counts: Dict[str, int] = {}
+    for key in state.keys():
+        for param in param_keys:
+            if key.endswith(param):
+                prefix = key[: -len(param)]
+                prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
                 break
-            except Exception as exc:  # pragma: no cover - IO issues are rare
-                load_error = exc
+    if prefix_counts:
+        prefix, count = max(prefix_counts.items(), key=lambda item: item[1])
+        if prefix and count >= max(1, len(param_keys) // 2):
+            state = {
+                (key[len(prefix) :] if key.startswith(prefix) else key): value
+                for key, value in state.items()
+            }
+
+    # Some checkpoints omit the "model." prefix for HuggingFace weights.
+    if hasattr(module, "model") and isinstance(module.model, torch.nn.Module):
+        needs_prefix = not any(key.startswith("model.") for key in state)
+        if needs_prefix and any(
+            key.startswith(prefix) for prefix in ("cls.", "deberta.", "encoder.", "embeddings.")
+        ):
+            state = {f"model.{key}": value for key, value in state.items()}
+
+    return state
+
+
+def _candidate_checkpoint_paths(base_path: Path) -> Iterable[Path]:
+    """Yield plausible filenames for a checkpoint given a preferred path."""
+
+    yield base_path
+    if base_path.suffix:
+        yield base_path.with_suffix(".safetensors")
+    parent = base_path.parent
+    for name in ("model.safetensors", "model.pt", "model.bin", "pytorch_model.bin"):
+        yield parent / name
+
+
+def load_checkpoint_state(module: torch.nn.Module, checkpoint_path: Path) -> Tuple[Sequence[str], Sequence[str]]:
+    """Load weights into ``module`` from ``checkpoint_path`` if available."""
+
+    if module is None:
+        raise ValueError("module must not be None")
+
+    checkpoint_path = Path(checkpoint_path)
+    state: Optional[object] = None
+    load_error: Optional[Exception] = None
+    used_path: Optional[Path] = None
+
+    for candidate in dict.fromkeys(_candidate_checkpoint_paths(checkpoint_path)):
+        if not candidate.exists():
+            continue
+        try:
+            if candidate.suffix == ".safetensors":
+                if load_safetensor is None:
+                    raise RuntimeError("safetensors support is unavailable")
+                state = load_safetensor(str(candidate), device="cpu")
+            else:
+                state = torch.load(candidate, map_location="cpu")
+            used_path = candidate
+            break
+        except Exception as exc:  # pragma: no cover - IO issues are rare
+            load_error = exc
+            LOGGER.debug("Failed to load checkpoint from %s: %s", candidate, exc)
+
     if state is None:
         if load_error is not None:
-            LOGGER.warning("Failed to load checkpoint from %s: %s", checkpoint_path, load_error)
-        else:
-            LOGGER.info("No checkpoint found at %s", checkpoint_path)
-        return 0, 0
-    state = torch.load(checkpoint_path, map_location="cpu")
+            raise RuntimeError(f"Failed to load checkpoint from {checkpoint_path}") from load_error
+        raise FileNotFoundError(f"No checkpoint found at {checkpoint_path}")
+
+    LOGGER.info("Loaded checkpoint weights from %s", used_path)
+
     state = _unwrap_state_dict(state)
+    state = _adapt_state_dict(module, state)
     state = _harmonize_prefixes(module, state)
+
     missing, unexpected = module.load_state_dict(state, strict=False)
     if missing:
         LOGGER.warning("Missing keys for %s: %s", module.__class__.__name__, missing)
@@ -330,13 +218,16 @@ def _adapt_state_dict(module: torch.nn.Module, state: object) -> object:
         LOGGER.warning("Unexpected keys for %s: %s", module.__class__.__name__, unexpected)
     if not missing and not unexpected:
         LOGGER.info("All weights loaded for %s", module.__class__.__name__)
+
     return missing, unexpected
 
 
 def load_tokenizer(psmiles_dir: Path) -> Tuple[object, int]:
     """Load the tokenizer packaged with the PSMILES encoder if possible."""
 
+    psmiles_dir = Path(psmiles_dir)
     sp_path = psmiles_dir / "tokenizer.model"
+
     if sp_path.exists() and spm is not None:
         try:
             processor = spm.SentencePieceProcessor()
@@ -428,64 +319,9 @@ def load_tokenizer(psmiles_dir: Path) -> Tuple[object, int]:
             return tokenizer, len(tokenizer)
         except Exception as exc:  # pragma: no cover - fallback path
             LOGGER.warning("Falling back to simple tokenizer because HF tokenizer failed: %s", exc)
-    if spm is not None:
-        sp_path = psmiles_dir / "tokenizer.model"
-        if sp_path.exists():
-            try:
-                processor = spm.SentencePieceProcessor()
-                processor.Load(str(sp_path))
 
-                class SentencePieceTokenizer:
-                    def __init__(self, proc: spm.SentencePieceProcessor) -> None:
-                        self._processor = proc
-                        self.mask_token = "<mask>"
-                        self.pad_token = "<pad>"
-                        self.cls_token = "<cls>"
-                        self.sep_token = "<sep>"
-                        self.unk_token = "<unk>"
-                        self.max_len = 128
-
-                        self.mask_token_id = self._resolve_token_id(self.mask_token)
-                        self.pad_token_id = self._resolve_token_id(self.pad_token)
-                        self.cls_token_id = self._resolve_token_id(self.cls_token)
-                        self.sep_token_id = self._resolve_token_id(self.sep_token)
-                        self.unk_token_id = self._resolve_token_id(self.unk_token)
-
-                    def _resolve_token_id(self, token: str) -> int:
-                        idx = self._processor.PieceToId(token)
-                        if idx < 0:
-                            idx = self._processor.unk_id()
-                        return int(idx)
-
-                    def __len__(self) -> int:
-                        return self._processor.GetPieceSize()
-
-                    def __call__(
-                        self,
-                        text: str,
-                        *,
-                        truncation: bool = True,
-                        padding: str = "max_length",
-                        max_length: Optional[int] = None,
-                    ) -> Dict[str, Sequence[int]]:
-                        max_len = max_length or getattr(self, "max_len", 128)
-                        ids = list(self._processor.EncodeAsIds(text))
-                        if truncation:
-                            ids = ids[:max_len]
-                        attention = [1] * len(ids)
-                        if padding == "max_length" and len(ids) < max_len:
-                            pad_id = self.pad_token_id
-                            pad_len = max_len - len(ids)
-                            ids = ids + [pad_id] * pad_len
-                            attention = attention + [0] * pad_len
-                        return {"input_ids": ids, "attention_mask": attention}
-
-                tokenizer = SentencePieceTokenizer(processor)
-                tokenizer.model_max_length = getattr(tokenizer, "max_len", 128)
-                return tokenizer, len(tokenizer)
-            except Exception as exc:  # pragma: no cover - safety fallback
-                LOGGER.warning("Failed to load SentencePiece tokenizer: %s", exc)
     tokenizer = SimplePSMILESTokenizer()
+    LOGGER.info("Using simple PSMILES tokenizer")
     return tokenizer, len(tokenizer)
 
 
@@ -500,10 +336,10 @@ def load_multimodal_model(
     checkpoints = checkpoints.resolve()
     tokenizer, vocab_size = load_tokenizer(checkpoints.psmiles_dir)
 
-    gine = None
-    schnet = None
-    fp = None
-    psmiles = None
+    gine: Optional[GineEncoder] = None
+    schnet: Optional[NodeSchNetWrapper] = None
+    fp: Optional[FingerprintEncoder] = None
+    psmiles: Optional[PSMILESDebertaEncoder] = None
 
     try:
         gine = GineEncoder()
@@ -555,3 +391,4 @@ def load_multimodal_model(
 
 
 __all__ = ["load_checkpoint_state", "load_multimodal_model", "load_tokenizer"]
+
