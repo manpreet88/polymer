@@ -160,6 +160,8 @@ class NodeSchNetWrapper(nn.Module):
         pos = pos.to(device)
         if batch is None or batch.numel() == 0:
             batch = torch.zeros(z.size(0), dtype=torch.long, device=device)
+        else:
+            batch = batch.to(device)
         try:
             edge_index = radius_graph(pos, r=SCHNET_CUTOFF, batch=batch, max_num_neighbors=SCHNET_MAX_NEIGHBORS)
         except Exception:
@@ -167,8 +169,21 @@ class NodeSchNetWrapper(nn.Module):
         node_h = self.schnet(z=z, pos=pos, batch=batch)
         if node_h is None:
             raise RuntimeError("SchNet forward returned None.")
-        pooled = torch.zeros((int(batch.max().item()) + 1, node_h.size(1)), device=node_h.device)
-        for idx in range(pooled.size(0)):
+        num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
+        hidden_dim = self.pool_proj.in_features
+        if node_h.numel() == 0:
+            pooled = self.pool_proj.weight.new_zeros((num_graphs, hidden_dim))
+            return self.pool_proj(pooled)
+        if node_h.size(0) != batch.size(0):
+            LOGGER.warning(
+                "SchNet produced %s node embeddings for %s atoms; falling back to mean pooling.",
+                node_h.size(0),
+                batch.size(0),
+            )
+            pooled = node_h.mean(dim=0, keepdim=True).expand(num_graphs, -1).contiguous()
+            return self.pool_proj(pooled)
+        pooled = node_h.new_zeros((num_graphs, node_h.size(1)))
+        for idx in range(num_graphs):
             mask = batch == idx
             if mask.any():
                 pooled[idx] = node_h[mask].mean(dim=0)

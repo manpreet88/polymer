@@ -167,11 +167,33 @@ def _candidate_checkpoint_paths(base_path: Path) -> Iterable[Path]:
 
     base_path = Path(base_path)
 
-    yield base_path
-    if base_path.suffix:
-        yield base_path.with_suffix(".safetensors")
-    parent = base_path.parent
-    for name in ("model.safetensors", "model.pt", "model.bin", "pytorch_model.bin"):
+    if base_path.is_dir():
+        parent = base_path
+        preferred: Tuple[Path, ...] = (
+            parent / "pytorch_model.bin",
+            parent / "model.safetensors",
+            parent / "model.pt",
+            parent / "model.bin",
+        )
+        for path in preferred:
+            yield path
+    else:
+        yield base_path
+        if base_path.suffix:
+            yield base_path.with_suffix(".safetensors")
+        parent = base_path.parent
+
+    for name in (
+        "model.safetensors",
+        "model.pt",
+        "model.bin",
+        "pytorch_model.bin",
+        "best_model.safetensors",
+        "best_model.pt",
+        "best_model.pth",
+        "best.ckpt",
+        "last.ckpt",
+    ):
         yield parent / name
 
 
