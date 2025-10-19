@@ -11,6 +11,7 @@ import json
 import gc
 import sys
 import csv
+from pathlib import Path
 from typing import List, Optional, Dict
 
 import numpy as np
@@ -1544,6 +1545,74 @@ def main(smoke: bool = False):
     print("\n" + "="*80)
     print("All properties processed. Results saved to", RESULTS_TXT)
     print("="*80)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight utilities for agent orchestrators
+# ---------------------------------------------------------------------------
+_GEN_REFERENCE_CACHE = None
+
+
+def _load_generation_reference():
+    """Load a lightweight catalog for retrieval-based candidate suggestions."""
+
+    global _GEN_REFERENCE_CACHE
+    if _GEN_REFERENCE_CACHE is not None:
+        return _GEN_REFERENCE_CACHE
+
+    candidates = [
+        Path(POLYINFO_CSV_PATH),
+        Path(__file__).resolve().parent / "examples" / "data" / "polymer_reference.csv",
+    ]
+    for candidate in candidates:
+        try:
+            resolved = Path(candidate).expanduser().resolve()
+        except Exception:
+            continue
+        if resolved.exists():
+            try:
+                table = pd.read_csv(resolved, engine="python")
+                _GEN_REFERENCE_CACHE = table
+                return table
+            except Exception:
+                continue
+    return None
+
+
+def suggest_candidates_for_psmiles(psmiles: str, *, top_k: int = 5):
+    """Return catalog polymers similar to the provided PSMILES string."""
+
+    table = _load_generation_reference()
+    if table is None or not isinstance(psmiles, str) or not psmiles:
+        return []
+
+    df = table.copy()
+    df["psmiles_value"] = df.get("psmiles", "").astype(str)
+    target = psmiles
+
+    try:
+        from difflib import SequenceMatcher
+
+        df["_similarity"] = df["psmiles_value"].apply(
+            lambda candidate: SequenceMatcher(None, candidate, target).ratio()
+        )
+    except Exception:
+        df["_similarity"] = 0.0
+
+    ranked = df.sort_values("_similarity", ascending=False).head(top_k)
+    suggestions = []
+    for _, row in ranked.iterrows():
+        suggestions.append(
+            {
+                "psmiles": row.get("psmiles"),
+                "similarity": float(row.get("_similarity", 0.0)),
+                "name": row.get("name"),
+                "source": row.get("source", "reference"),
+                "description": row.get("description"),
+            }
+        )
+    return suggestions
+
 
 if __name__ == "__main__":
     main()

@@ -16,6 +16,11 @@ from .config import CheckpointConfig
 from .datamodels import EmbeddingResult, ProcessedPolymer, PropertyPrediction
 from .embedding_service import MultimodalEmbeddingService
 
+try:  # pragma: no cover - optional dependency bridge
+    from Property_Prediction import estimate_properties_for_psmiles
+except Exception:  # pragma: no cover - fall back if helper missing
+    estimate_properties_for_psmiles = None
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -58,6 +63,7 @@ class PropertyPredictorEnsemble:
         self.embedding_dim = embedding_dim
         self.heads: Dict[str, List[PropertyHead]] = {}
         self.specs: Dict[str, PropertyHeadSpec] = {}
+        self._psmiles_estimator = estimate_properties_for_psmiles
         self._load_heads()
 
     def _load_heads(self) -> None:
@@ -99,6 +105,26 @@ class PropertyPredictorEnsemble:
                 self.heads[name] = ensemble
                 self.specs[name] = PropertyHeadSpec(name=name, unit=unit, description=description)
 
+    def _predict_from_reference(self, psmiles: str, properties: Optional[Iterable[str]] = None) -> List[PropertyPrediction]:
+        if self._psmiles_estimator is None:
+            return []
+        try:
+            estimates = self._psmiles_estimator(psmiles, properties=properties)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.warning("Reference property estimation failed for %s: %s", psmiles, exc)
+            return []
+        predictions: List[PropertyPrediction] = []
+        for name, value in estimates.items():
+            predictions.append(
+                PropertyPrediction(
+                    name=name,
+                    mean=float(value),
+                    std=0.0,
+                    unit=self.specs.get(name, PropertyHeadSpec(name)).unit,
+                )
+            )
+        return predictions
+
     # ------------------------------------------------------------------
     # Prediction API
     # ------------------------------------------------------------------
@@ -106,8 +132,12 @@ class PropertyPredictorEnsemble:
         return sorted(self.heads.keys())
 
     @torch.inference_mode()
-    def predict_from_embedding(self, embedding: EmbeddingResult) -> List[PropertyPrediction]:
+    def predict_from_embedding(
+        self, embedding: EmbeddingResult, *, psmiles: Optional[str] = None
+    ) -> List[PropertyPrediction]:
         if not self.heads:
+            if psmiles is not None:
+                return self._predict_from_reference(psmiles)
             return []
         vector = torch.tensor(embedding.vector, dtype=torch.float32, device=self.device)
         preds: List[PropertyPrediction] = []
@@ -132,8 +162,10 @@ class PropertyPredictorEnsemble:
 
     @torch.inference_mode()
     def predict_polymer(self, polymer: ProcessedPolymer) -> List[PropertyPrediction]:
+        if not self.heads and self._psmiles_estimator is not None:
+            return self._predict_from_reference(polymer.psmiles)
         embedding = self.embedding_service.embed_polymer(polymer)
-        return self.predict_from_embedding(embedding)
+        return self.predict_from_embedding(embedding, psmiles=polymer.psmiles)
 
     @torch.inference_mode()
     def predict_many(self, polymers: Iterable[ProcessedPolymer]) -> Dict[str, List[PropertyPrediction]]:
