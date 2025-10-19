@@ -106,6 +106,9 @@ class PolymerKnowledgeBase:
     def is_empty(self) -> bool:
         return len(self.entries) == 0
 
+    def contains_psmiles(self, psmiles: str) -> bool:
+        return any(entry.psmiles == psmiles for entry in self.entries)
+
     def _matrix(self) -> np.ndarray:
         if self.is_empty():
             return np.zeros((0, self.config.embedding_dim), dtype=np.float32)

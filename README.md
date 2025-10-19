@@ -7,6 +7,7 @@ This repository packages the multimodal polymer foundation model into an interac
 - **Data ingestion tool** – normalises user-supplied PSMILES and produces graph, geometry, and fingerprint modalities via `AdvancedPolymerMultimodalExtractor`.
 - **Multimodal embedding service** – loads the contrastive learning encoders and projects polymers into a unified latent space.
 - **Knowledge base / RAG** – stores embeddings plus metadata for similarity search, filtering, and retrieval-augmented reasoning.
+- **Domain knowledge connectors** – ingest PoLyInfo, Polymer Genome, MatWeb, and handbook datasets via CSV/JSON catalogs for grounded retrieval.
 - **Property prediction ensemble** – optional regression heads provide mean/std estimates for density, Tg, melting point, etc.
 - **Generative assistant** – retrieves similar polymers and proposes lightweight RDKit mutations, evaluating them with the predictor.
 - **GPT-4 orchestrator** – exposes all tools to a GPT-4 agent that can route tasks, call tools, and synthesise reports.
@@ -144,14 +145,27 @@ python -m agent_pipeline.ui_cli "[*]CCO"
 
 The command prints the canonicalised structure, nearest neighbours stored in the knowledge base, and any available property predictions. The knowledge base is persisted to `knowledge_base/` by default; pass `--no-save` to skip persistence.
 
-## Example workflow
+## Example workflows
 
-See `examples/example_session.py` for a notebook-style script that:
+- `examples/example_session.py` demonstrates a lightweight notebook experience that:
+  1. Builds the core services.
+  2. Loads a batch of polymers from CSV and populates the knowledge base.
+  3. Answers natural language questions via GPT-4 by wiring ingestion, embedding, retrieval, prediction, and generation tools together.
+- `examples/high_level_scenarios.py` mirrors the oncology-agent paper with two personas:
+  - **Non-expert triage** – a technician provides a rough PSMILES and immediately receives property predictions plus nearest neighbours retrieved from PoLyInfo/Polymer Genome/MatWeb references.
+  - **Expert design studio** – a polymer chemist explores targeted candidates with automated retrieval, generator-driven mutations, quantitative scoring, and RDKit visualisations saved to `visualisations/`.
 
-1. Builds the core services.
-2. Loads a batch of polymers from CSV and populates the knowledge base.
-3. Answers natural language questions via GPT-4 by wiring ingestion, embedding, retrieval, prediction, and generation tools together.
-4. Logs all tool invocations for provenance.
+Both scripts load a curated catalog located at `examples/data/polymer_reference.csv`. Replace this file with richer exports (PoLyInfo CSV, Polymer Genome JSONL, MatWeb scrapes, Polymer Handbook tables) to ground the knowledge base in authoritative sources. Use:
+
+```python
+from pathlib import Path
+from agent_pipeline import build_pipeline_services, seed_knowledge_base_from_catalog
+
+services = build_pipeline_services()
+seed_knowledge_base_from_catalog(services, Path("polymer_catalog.csv"), overwrite=True)
+```
+
+The loader accepts CSV/TSV (columns prefixed with `property:` become structured numeric properties) and JSON/JSONL formats with arbitrary metadata.
 
 ## Provenance and safety
 
