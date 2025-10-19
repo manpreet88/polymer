@@ -165,6 +165,8 @@ def _harmonize_prefixes(module: torch.nn.Module, state: object) -> object:
 def _candidate_checkpoint_paths(base_path: Path) -> Iterable[Path]:
     """Yield plausible filenames for a checkpoint given a preferred path."""
 
+    base_path = Path(base_path)
+
     yield base_path
     if base_path.suffix:
         yield base_path.with_suffix(".safetensors")
