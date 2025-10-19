@@ -151,10 +151,14 @@ class NodeSchNetWrapper(nn.Module):
             cutoff=SCHNET_CUTOFF,
             max_num_neighbors=SCHNET_MAX_NEIGHBORS,
         )
-        self.pool_proj = nn.Linear(SCHNET_HIDDEN, SCHNET_HIDDEN)
-        self.node_classifier = nn.Linear(SCHNET_HIDDEN, MASK_ATOM_ID + 1)
+        hidden_dim = getattr(self.schnet, "hidden_channels", SCHNET_HIDDEN)
+        self._node_hidden_dim = int(hidden_dim)
+        self.pool_proj = nn.Linear(self._node_hidden_dim, self._node_hidden_dim)
+        self.node_classifier = nn.Linear(self._node_hidden_dim, MASK_ATOM_ID + 1)
 
-    def forward(self, z: torch.Tensor, pos: torch.Tensor, batch: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _node_embeddings(
+        self, z: torch.Tensor, pos: torch.Tensor, batch: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = next(self.parameters()).device
         z = z.to(device)
         pos = pos.to(device)
@@ -162,43 +166,67 @@ class NodeSchNetWrapper(nn.Module):
             batch = torch.zeros(z.size(0), dtype=torch.long, device=device)
         else:
             batch = batch.to(device)
+
+        model = self.schnet
         try:
-            edge_index = radius_graph(pos, r=SCHNET_CUTOFF, batch=batch, max_num_neighbors=SCHNET_MAX_NEIGHBORS)
+            edge_index, edge_weight = model.interaction_graph(pos, batch)
         except Exception:
-            edge_index = None
-        node_h = self.schnet(z=z, pos=pos, batch=batch)
-        if node_h is None:
-            raise RuntimeError("SchNet forward returned None.")
-        num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
-        hidden_dim = self.pool_proj.in_features
-        if node_h.numel() == 0:
-            pooled = self.pool_proj.weight.new_zeros((num_graphs, hidden_dim))
-            return self.pool_proj(pooled)
-        if node_h.size(0) != batch.size(0):
-            LOGGER.warning(
-                "SchNet produced %s node embeddings for %s atoms; falling back to mean pooling.",
-                node_h.size(0),
-                batch.size(0),
+            if radius_graph is None:
+                raise
+            edge_index = radius_graph(
+                pos,
+                r=SCHNET_CUTOFF,
+                batch=batch,
+                max_num_neighbors=SCHNET_MAX_NEIGHBORS,
             )
-            pooled = node_h.mean(dim=0, keepdim=True).expand(num_graphs, -1).contiguous()
+            if edge_index.numel() > 0:
+                row, col = edge_index
+                edge_weight = (pos[row] - pos[col]).norm(dim=-1)
+            else:
+                edge_weight = pos.new_zeros((0,))
+
+        if edge_index.numel() == 0:
+            edge_attr = pos.new_zeros((0, model.num_gaussians))
+        else:
+            edge_attr = model.distance_expansion(edge_weight)
+
+        h = model.embedding(z)
+        for interaction in model.interactions:
+            h = h + interaction(h, edge_index, edge_weight, edge_attr)
+
+        return h, batch
+
+    def forward(self, z: torch.Tensor, pos: torch.Tensor, batch: Optional[torch.Tensor] = None) -> torch.Tensor:
+        node_h, batch = self._node_embeddings(z, pos, batch)
+        num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
+
+        if node_h.numel() == 0:
+            pooled = node_h.new_zeros((num_graphs, self._node_hidden_dim))
             return self.pool_proj(pooled)
-        pooled = node_h.new_zeros((num_graphs, node_h.size(1)))
+
+        hidden_dim = node_h.size(1)
+        if hidden_dim != self._node_hidden_dim:
+            LOGGER.warning(
+                "SchNet hidden dimension mismatch (expected %s, got %s); using first %s features.",
+                self._node_hidden_dim,
+                hidden_dim,
+                min(hidden_dim, self._node_hidden_dim),
+            )
+            pooled = node_h.new_zeros((num_graphs, self._node_hidden_dim))
+        else:
+            pooled = node_h.new_zeros((num_graphs, hidden_dim))
         for idx in range(num_graphs):
             mask = batch == idx
             if mask.any():
-                pooled[idx] = node_h[mask].mean(dim=0)
+                mean_vec = node_h[mask].mean(dim=0)
+                pooled[idx, : mean_vec.size(0)] = mean_vec[: pooled.size(1)]
         return self.pool_proj(pooled)
 
     def node_logits(self, z: torch.Tensor, pos: torch.Tensor, batch: Optional[torch.Tensor] = None) -> torch.Tensor:
-        device = next(self.parameters()).device
-        z = z.to(device)
-        pos = pos.to(device)
-        if batch is None or batch.numel() == 0:
-            batch = torch.zeros(z.size(0), dtype=torch.long, device=device)
-        logits = self.schnet(z=z, pos=pos, batch=batch)
-        if logits is None:
-            raise RuntimeError("SchNet returned None for node logits.")
-        return self.node_classifier(logits)
+        node_h, _ = self._node_embeddings(z, pos, batch)
+        if node_h.numel() == 0:
+            return node_h.new_zeros((0, self.node_classifier.out_features))
+        return self.node_classifier(node_h)
 
 
 class FingerprintEncoder(nn.Module):
