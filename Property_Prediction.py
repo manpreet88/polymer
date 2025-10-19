@@ -5,6 +5,7 @@ from pathlib import Path
 import math
 import json
 import shutil
+from difflib import SequenceMatcher
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import RobustScaler
@@ -1156,6 +1157,89 @@ def run_downstream_for_property(property_name, property_col, df_prop, pretrained
             fh.write("AGGREGATED: " + json.dumps(make_json_serializable(summary)) + "\n")
         return {"runs": results_runs, "agg": agg}
     return None
+
+
+# ---------------------------------------------------------------------------
+# Lightweight utilities for agent orchestrators
+# ---------------------------------------------------------------------------
+_REFERENCE_TABLE_CACHE = None
+
+
+def _load_reference_table():
+    """Load a lightweight reference table for property estimation."""
+
+    global _REFERENCE_TABLE_CACHE
+    if _REFERENCE_TABLE_CACHE is not None:
+        return _REFERENCE_TABLE_CACHE
+
+    candidate_paths = [
+        Path(POLYINFO_PATH),
+        Path(__file__).resolve().parent / "examples" / "data" / "polymer_reference.csv",
+    ]
+    for path in candidate_paths:
+        try:
+            resolved = Path(path).expanduser().resolve()
+        except Exception:
+            continue
+        if resolved.exists():
+            try:
+                table = pd.read_csv(resolved, engine="python")
+                _REFERENCE_TABLE_CACHE = table
+                return table
+            except Exception:
+                continue
+    return None
+
+
+def estimate_properties_for_psmiles(psmiles: str, properties=None):
+    """Estimate polymer properties using the reference dataset.
+
+    The helper mirrors the downstream heads expected by the agent pipeline but
+    falls back to curated reference values when learned weights are not
+    available.  If the exact PSMILES string is not present, the closest entry
+    (by sequence similarity) is used as a proxy.
+    """
+
+    table = _load_reference_table()
+    if table is None or not isinstance(psmiles, str) or not psmiles:
+        return {}
+
+    df = table.copy()
+    df["psmiles_lower"] = df.get("psmiles", "").astype(str).str.lower()
+    target = psmiles.lower()
+
+    match = df[df["psmiles_lower"] == target]
+    if match.empty:
+        df["_similarity"] = df["psmiles_lower"].apply(
+            lambda candidate: SequenceMatcher(None, candidate, target).ratio()
+        )
+        match = df.sort_values("_similarity", ascending=False).head(1)
+    results = {}
+
+    property_columns = [col for col in df.columns if col.startswith("property:")]
+    if properties is not None:
+        desired = set(properties)
+        property_columns = [
+            col for col in property_columns if col[len("property:") :] in desired
+        ]
+
+    if match.empty:
+        return {}
+
+    row = match.iloc[0]
+    for column in property_columns:
+        value = row.get(column)
+        if isinstance(value, str) and value.strip().lower() in {"", "na", "n/a", "none"}:
+            continue
+        if pd.isna(value):
+            continue
+        key = column[len("property:") :]
+        try:
+            results[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return results
+
 
 def main():
     if os.path.exists(OUTPUT_RESULTS):

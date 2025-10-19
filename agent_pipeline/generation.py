@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from rdkit import Chem
 
@@ -15,6 +15,12 @@ from .property_predictor import PropertyPredictorEnsemble
 from .data_ingestion import PolymerDataIngestionTool
 
 LOGGER = logging.getLogger(__name__)
+
+
+try:  # pragma: no cover - optional dependency bridge
+    from Polymer_Generation import suggest_candidates_for_psmiles
+except Exception:  # pragma: no cover - fall back if helper missing
+    suggest_candidates_for_psmiles = None
 
 
 def _mutate_psmiles(psmiles: str, *, max_attempts: int = 5) -> Optional[str]:
@@ -68,8 +74,9 @@ class PolymerGeneratorTool:
         """Return retrieval-augmented generations for a seed polymer."""
 
         embedding = self.embedding_service.embed_polymer(seed_polymer)
-        results = self.knowledge_base.search(embedding.vector, top_k=top_k)
+        results = list(self.knowledge_base.search(embedding.vector, top_k=top_k))
         generated: List[GeneratedPolymer] = []
+        seen: Set[str] = set()
 
         for entry, score in results:
             metadata: Dict = {
@@ -83,6 +90,7 @@ class PolymerGeneratorTool:
                     predictions = self.predictor.predict_polymer(seed_polymer)
                 except Exception as exc:
                     LOGGER.warning("Property prediction failed during generation: %s", exc)
+            seen.add(entry.psmiles)
             generated.append(
                 GeneratedPolymer(
                     psmiles=entry.psmiles,
@@ -90,6 +98,47 @@ class PolymerGeneratorTool:
                     property_estimates=predictions,
                 )
             )
+
+        if suggest_candidates_for_psmiles is not None and len(generated) < top_k:
+            try:
+                suggestions = suggest_candidates_for_psmiles(
+                    seed_polymer.psmiles, top_k=top_k
+                )
+            except Exception as exc:  # pragma: no cover - defensive guard
+                LOGGER.warning("Reference candidate suggestion failed: %s", exc)
+                suggestions = []
+            for suggestion in suggestions:
+                candidate_psmiles = suggestion.get("psmiles")
+                if not candidate_psmiles or candidate_psmiles in seen:
+                    continue
+                seen.add(candidate_psmiles)
+                metadata = {
+                    "similarity": float(suggestion.get("similarity", 0.0)),
+                    "retrieved_from": suggestion.get("source", "reference"),
+                    "mode": "catalog",
+                }
+                if suggestion.get("description"):
+                    metadata["description"] = suggestion["description"]
+                predictions: List[PropertyPrediction] = []
+                try:
+                    candidate_polymer = self.ingestion_tool.ingest_psmiles(
+                        candidate_psmiles,
+                        source="catalog",
+                        metadata={"source": suggestion.get("source")},
+                    )
+                    if self.predictor is not None:
+                        predictions = self.predictor.predict_polymer(candidate_polymer)
+                except Exception as exc:
+                    LOGGER.warning("Failed to prepare catalog candidate %s: %s", candidate_psmiles, exc)
+                generated.append(
+                    GeneratedPolymer(
+                        psmiles=candidate_psmiles,
+                        metadata=metadata,
+                        property_estimates=predictions,
+                    )
+                )
+                if len(generated) >= top_k:
+                    break
 
         if mutations > 0:
             for entry, score in results[:mutations]:
