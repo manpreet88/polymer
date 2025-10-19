@@ -103,12 +103,22 @@ class GPT4Orchestrator:
                     messages.append({
                         "role": "assistant",
                         "content": None,
-                        "tool_calls": [call],
+                        "tool_calls": [
+                            {
+                                "id": call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.function.name,
+                                    "arguments": call.function.arguments,
+                                },
+                            }
+                        ],
                     })
                     messages.append({
                         "role": "tool",
                         "name": name,
                         "content": json.dumps(result, default=str),
+                        "tool_call_id": call.id,
                     })
                 continue
             if message.content:
