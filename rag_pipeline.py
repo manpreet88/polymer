@@ -2,17 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-Polymer RAG pipeline (extensive edition)
+Polymer RAG pipeline (extensive edition, hardened + more OA sources)
 
-Features
---------
-- Fetch thousands of OA PDFs from OpenAlex + arXiv (no API keys).
-- Parallel downloads with retries/backoff; de-dup via SHA256; manifest.jsonl.
-- Rich metadata (title, venue, year, url, source) attached to chunks.
-- BM25 + Vector ensemble using local RRF (robust across LangChain versions).
-- Embeddings: "sentence-transformers/all-mpnet-base-v2" (default) or "intfloat/e5-large-v2"
-  with correct query/passage prefixing handled for you.
-- Vector store: Chroma (default) or FAISS (switch via `vector_backend`).
+What’s included
+---------------
+- Keyless web harvesting from:
+  • OpenAlex (OA-only, multiple types, robust PDF URL extraction)
+  • arXiv (Atom XML parsing for <link type="application/pdf">)
+  • Europe PMC (OA articles + PMC full text; extracts direct PDF URLs)
+  • Optional: direct PDF URLs (extra_pdf_urls)
+  • Optional: cautious DOI resolution (allowlisted OA domains only)
+
+- Parallel downloads with retries/backoff; SHA256 de-dup; manifest.jsonl
+- Rich metadata (title, venue, year, url, origin) attached to chunks
+- Ensemble retrieval: BM25 + Vector (Chroma or FAISS) fused with RRF
+- Embeddings: "sentence-transformers/all-mpnet-base-v2" (default)
+             or "intfloat/e5-large-v2" (auto query/passsage prefixing)
+- LangChain 0.1+ compatible (retriever invocation paths covered)
 
 Install
 -------
@@ -24,17 +30,18 @@ pip install -U \
 # Optional if using FAISS:
 # pip install faiss-cpu
 
-Usage (big build)
------------------
+Quick use (big web build)
+-------------------------
 from src.rag_pipeline import build_retriever_from_web, POLYMER_KEYWORDS
 
 retriever = build_retriever_from_web(
     polymer_keywords=POLYMER_KEYWORDS,
     max_arxiv=300,
     max_openalex=3000,
+    max_europepmc=3000,
     from_year=2010,
-    vector_backend="chroma",              # or "faiss"
-    embedding_model="intfloat/e5-large-v2",  # or "sentence-transformers/all-mpnet-base-v2"
+    vector_backend="chroma",                  # or "faiss"
+    embedding_model="intfloat/e5-large-v2",   # or "sentence-transformers/all-mpnet-base-v2"
     persist_dir="chroma_polymer_db_big",
     k=6,
 )
@@ -43,8 +50,10 @@ docs = retriever.get_relevant_documents("foundation models for polymer property 
 
 Notes
 -----
-- Be polite with very large crawls. OpenAlex per_page max is 200.
-- manifest.jsonl is written in the download directory so you can resume/rebuild easily.
+- Be polite with very large crawls (tiny sleeps are built-in).
+- manifest.jsonl is written in the download directory for resume/debug.
+- For OA publisher PDFs like Nature Communications, Europe PMC results
+  often include a direct PDF URL when it’s truly OA.
 """
 
 from __future__ import annotations
@@ -55,13 +64,15 @@ import json
 import hashlib
 import pathlib
 import tempfile
-from typing import List, Optional, Dict, Any, Iterable, Union
+import logging
+import xml.etree.ElementTree as ET
+from typing import List, Optional, Dict, Any, Iterable, Union, Tuple
 
 import requests
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# LangChain (compatible with 0.1.x and 0.2+ splits)
+# LangChain
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -69,14 +80,40 @@ from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
 from langchain_community.retrievers import BM25Retriever
 
 # --------------------------------------------------------------------------------------
-# Config
+# Logging / Config
 # --------------------------------------------------------------------------------------
 
-ARXIV_SEARCH_URL = "http://export.arxiv.org/api/query"
-OPENALEX_WORKS_URL = "https://api.openalex.org/works"  # keyless
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("polymer-rag")
+
+# Endpoints
+ARXIV_SEARCH_URL = "https://export.arxiv.org/api/query"        # Atom XML
+OPENALEX_WORKS_URL = "https://api.openalex.org/works"          # JSON
+EUROPE_PMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 
 DEFAULT_PERSIST_DIR = "chroma_polymer_db"
 DEFAULT_TMP_DOWNLOAD_DIR = os.path.join(tempfile.gettempdir(), "polymer_rag_pdfs")
+
+# OA allowlist for cautious DOI resolution (optional)
+PDF_DOMAIN_ALLOWLIST = {
+    "nature.com",            # includes Nature Communications OA PDFs
+    "springernature.com",
+    "springer.com",          # some OA journals
+    "frontiersin.org",
+    "mdpi.com",
+    "plos.org",
+    "royalsocietypublishing.org",
+    "elifesciences.org",
+    "biorxiv.org",           # not polymers usually, but harmless
+    "chemrxiv.org",
+    "arxiv.org",
+    "acscatalysis.org",      # sometimes OA
+    "pubs.acs.org",          # many paywalled; OA subset works (check headers)
+    "rsc.org",               # OA subset
+}
 
 # Polymer-centric keywords (broad & subfields, deduped later)
 POLYMER_KEYWORDS = [
@@ -92,6 +129,7 @@ POLYMER_KEYWORDS = [
     "foundation model polymer", "masked language model polymer", "polymer LLM",
     "self-supervised polymer", "transformer polymer", "Perceiver polymer", "Performer polymer",
     "representation learning polymer", "contrastive learning polymer",
+    "polymer language model", "polymer sequence modeling",
 
     # Electrolytes & energy
     "polymer electrolyte", "solid polymer electrolyte", "ionogel",
@@ -109,8 +147,7 @@ POLYMER_KEYWORDS = [
     "recyclable polymer", "depolymerization", "biopolymer",
 
     # Generative / property prediction
-    "generative model polymer", "inverse design polymer",
-    "property prediction polymer",
+    "generative model polymer", "inverse design polymer", "property prediction polymer",
 ]
 
 # --------------------------------------------------------------------------------------
@@ -125,10 +162,14 @@ def _safe_filename(name: str) -> str:
     name = re.sub(r"[^a-zA-Z0-9._-]+", "_", name)
     return name[:180]
 
-def _is_probably_pdf(raw: bytes, content_type: str = "") -> bool:
+def _is_probably_pdf(raw: bytes, content_type: str = "", url_hint: str = "") -> bool:
     if raw[:4] == b"%PDF":
         return True
-    return "pdf" in (content_type or "").lower()
+    if "pdf" in (content_type or "").lower():
+        return True
+    if url_hint.lower().endswith(".pdf"):
+        return True
+    return False
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -166,22 +207,30 @@ def _load_manifest(out_dir: str) -> Dict[str, Dict[str, Any]]:
     return data
 
 # --------------------------------------------------------------------------------------
-# Downloading PDFs (single + parallel with retry)
+# HTTP helpers
 # --------------------------------------------------------------------------------------
 
-def download_pdf(url: str, out_dir: str, suggested_name: Optional[str] = None,
-                 timeout: int = 60, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
+_UA = "polymer-rag/1.2 (+https://example.local)"
+
+def _http_get(url: str, timeout: int = 60, stream: bool = True, accept: Optional[str] = None) -> requests.Response:
+    headers = {"User-Agent": _UA}
+    if accept:
+        headers["Accept"] = accept
+    r = requests.get(url, headers=headers, timeout=timeout, stream=stream, allow_redirects=True)
+    r.raise_for_status()
+    return r
+
+def _download_pdf(url: str, out_dir: str, suggested_name: Optional[str] = None,
+                  timeout: int = 60, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """
     Download a PDF and return local file path, or None on failure.
     Deduplicates by SHA256 content hash. Writes manifest record if meta provided.
     """
     try:
-        headers = {"User-Agent": "polymer-rag/1.0 (+https://example.local)"}
-        with requests.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=True) as r:
-            r.raise_for_status()
-            content_type = r.headers.get("Content-Type", "")
-            raw = r.content
-        if not raw or not _is_probably_pdf(raw, content_type):
+        r = _http_get(url, timeout=timeout, stream=True)
+        content_type = r.headers.get("Content-Type", "")
+        raw = r.content  # okay since many PDFs are not gigantic; chunking could be added if needed
+        if not raw or not _is_probably_pdf(raw, content_type, url):
             return None
 
         sha = _sha256_bytes(raw)
@@ -211,7 +260,8 @@ def download_pdf(url: str, out_dir: str, suggested_name: Optional[str] = None,
             _append_manifest(out_dir, rec)
 
         return fpath
-    except Exception:
+    except Exception as e:
+        logger.debug(f"download_pdf failed for {url}: {e}")
         return None
 
 def _retry(fn, *args, _retries=3, _sleep=0.5, **kwargs):
@@ -224,11 +274,13 @@ def _retry(fn, *args, _retries=3, _sleep=0.5, **kwargs):
 
 def _download_one(entry: Union[str, Dict[str, Any]], out_dir: str):
     if isinstance(entry, dict):
-        return download_pdf(entry["url"], out_dir, suggested_name=entry.get("name"), meta=entry.get("meta"))
-    return download_pdf(entry, out_dir)
+        return _download_pdf(entry["url"], out_dir, suggested_name=entry.get("name"), meta=entry.get("meta"))
+    return _download_pdf(entry, out_dir)
 
 def parallel_download_pdfs(entries: List[Union[str, Dict[str, Any]]], out_dir: str, max_workers: int = 16) -> List[str]:
     _ensure_dir(out_dir)
+    if not entries:
+        return []
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [ex.submit(_retry, _download_one, e, out_dir) for e in entries]
@@ -239,12 +291,11 @@ def parallel_download_pdfs(entries: List[Union[str, Dict[str, Any]]], out_dir: s
     return results
 
 # --------------------------------------------------------------------------------------
-# arXiv (keyless)
+# arXiv (keyless; robust Atom parsing)
 # --------------------------------------------------------------------------------------
 
 def _arxiv_query_from_keywords(keywords: List[str]) -> str:
     kw = [k.replace('"', '') for k in keywords]
-    # Keep query compact; search title/abstract; include relevant categories
     terms = " OR ".join([f'ti:"{k}"' for k in kw] + [f'abs:"{k}"' for k in kw])
     cats = "(cat:cond-mat.mtrl-sci OR cat:cond-mat.soft OR cat:physics.chem-ph OR cat:cs.LG OR cat:stat.ML)"
     return f"({terms}) AND {cats}"
@@ -258,11 +309,23 @@ def fetch_arxiv_pdf_urls(keywords: List[str], max_results: int = 100, sort_by: s
         "sortBy": sort_by,
         "sortOrder": "descending",
     }
-    headers = {"User-Agent": "polymer-rag/1.0 (+https://example.local)"}
-    resp = requests.get(ARXIV_SEARCH_URL, params=params, headers=headers, timeout=60)
+    resp = _http_get(ARXIV_SEARCH_URL, timeout=60, stream=False, accept="application/atom+xml")
+    # requests can't combine params when we pre-composed; re-request with params:
+    resp = requests.get(ARXIV_SEARCH_URL, params=params, headers={"User-Agent": _UA, "Accept": "application/atom+xml"}, timeout=60)
     resp.raise_for_status()
-    xml = resp.text
-    urls = re.findall(r'href="(https?://arxiv\.org/pdf/[^"]+)"', xml)
+
+    root = ET.fromstring(resp.text)
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    urls: List[str] = []
+    for entry in root.findall("a:entry", ns):
+        pdf_url = None
+        for link in entry.findall("a:link", ns):
+            if (link.get("type") == "application/pdf") and link.get("href"):
+                pdf_url = link.get("href")
+                break
+        if pdf_url:
+            urls.append(pdf_url)
+    # de-dup
     seen = set()
     return [u for u in urls if not _dedup_seen(u, seen)]
 
@@ -271,14 +334,13 @@ def fetch_arxiv_pdfs(keywords: List[str], out_dir: str, max_results: int = 100, 
     entries = []
     for url in urls:
         suggested = url.rstrip("/").split("/")[-1]
-        entries.append({"url": url, "name": suggested, "meta": {"source": "arxiv", "url": url}})
-    # Parallel (still kind to arXiv)
+        entries.append({"url": url, "name": suggested, "meta": {"origin": "arxiv", "url": url}})
     paths = parallel_download_pdfs(entries, out_dir, max_workers=8)
-    time.sleep(polite_delay)  # small idle gap after batch
+    time.sleep(polite_delay)
     return paths
 
 # --------------------------------------------------------------------------------------
-# OpenAlex (keyless, big pagination)
+# OpenAlex (keyless, broad types, robust PDF extraction)
 # --------------------------------------------------------------------------------------
 
 def _openalex_build_search_query(keywords: List[str]) -> str:
@@ -287,14 +349,19 @@ def _openalex_build_search_query(keywords: List[str]) -> str:
 def _openalex_fetch_works(
     keywords: List[str],
     max_results: int = 5000,
-    per_page: int = 200,         # OpenAlex max page size
+    per_page: int = 200,
     from_year: int = 2000,
-    allowed_types: List[str] = ("journal-article", "posted-content"),
+    allowed_types: List[str] = (
+        "journal-article",
+        "posted-content",       # preprints
+        "proceedings-article",  # conferences
+        "book-chapter",
+    ),
 ) -> List[Dict[str, Any]]:
     search = _openalex_build_search_query(keywords)
     page = 1
     works: List[Dict[str, Any]] = []
-    headers = {"User-Agent": "polymer-rag/1.0 (+https://example.local)"}
+    headers = {"User-Agent": _UA}
 
     filters = [
         "is_oa:true",
@@ -312,9 +379,9 @@ def _openalex_fetch_works(
             "sort": "publication_date:desc",
             "filter": filter_str,
         }
-        resp = requests.get(OPENALEX_WORKS_URL, params=params, headers=headers, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
+        r = requests.get(OPENALEX_WORKS_URL, params=params, headers=headers, timeout=60)
+        r.raise_for_status()
+        data = r.json()
         results = data.get("results", [])
         if not results:
             break
@@ -329,30 +396,48 @@ def _openalex_fetch_works(
 
     return works
 
+def _first_pdf_like(*candidates: Optional[str]) -> Optional[str]:
+    for c in candidates:
+        if c and c.lower().endswith(".pdf"):
+            return c
+    for c in candidates:
+        if c and ("pdf" in c.lower() or "arxiv.org" in c.lower()):
+            return c
+    return None
+
 def _openalex_extract_pdf_entries(works: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Returns list of download entries:
-      {"url": pdf_url, "name": filename_hint, "meta": {title, year, venue, url, source}}
-    """
     out: List[Dict[str, Any]] = []
     seen = set()
     for w in works:
+        pl = (w.get("primary_location") or {})
         best = (w.get("best_oa_location") or {})
-        pdf = best.get("url_for_pdf") or ""
-        if not pdf:
-            pl = w.get("primary_location") or {}
-            pdf = pl.get("pdf_url") or ""
+        oa = (w.get("open_access") or {})
+
+        pdf = _first_pdf_like(
+            best.get("url_for_pdf"),
+            pl.get("pdf_url"),
+            oa.get("oa_url"),
+            (pl.get("source") or {}).get("url")
+        )
         if not pdf or pdf in seen:
             continue
         seen.add(pdf)
+
         title = (w.get("title") or "paper").strip()
         year = w.get("publication_year")
         venue = ((w.get("host_venue") or {}).get("display_name") or "").strip()
         name = " - ".join([s for s in [title, venue, str(year or "")] if s])
+
         out.append({
             "url": pdf,
             "name": name,
-            "meta": {"title": title, "year": year, "venue": venue, "url": pdf, "source": "openalex"}
+            "meta": {
+                "title": title,
+                "year": year,
+                "venue": venue,
+                "url": pdf,
+                "origin": "openalex",
+            }
         })
     return out
 
@@ -366,6 +451,137 @@ def fetch_openalex_pdfs(
     works = _openalex_fetch_works(keywords, max_results=max_results, per_page=per_page, from_year=from_year)
     entries = _openalex_extract_pdf_entries(works)
     return parallel_download_pdfs(entries, out_dir, max_workers=16)
+
+# --------------------------------------------------------------------------------------
+# Europe PMC (keyless; OA & PMC full text; often publisher PDFs like Nature OA)
+# --------------------------------------------------------------------------------------
+
+def _eupmc_build_query(keywords: List[str], from_year: int) -> str:
+    """
+    Europe PMC advanced query:
+      - OA only
+      - From specified year
+      - Keyword search in title/abstract/fulltext by default
+    """
+    # Quote each term without using an f-string (avoids backslash-in-expression issue)
+    kw = ['"{}"'.format(k.replace('"', '')) for k in keywords]
+    kw_expr = " OR ".join(kw) if kw else '"polymer"'
+    return f"({kw_expr}) AND OPEN_ACCESS:y AND PUB_YEAR:[{from_year} TO *]"
+
+def _eupmc_extract_pdf_from_result(r: Dict[str, Any]) -> Optional[str]:
+    # Priorities:
+    # 1) pdfUrl (PMC-hosted OA full text)
+    # 2) fullTextUrlList.fullTextUrl where documentStyle == "pdf" or availability == "Open access"
+    # See: https://europepmc.org/RestfulWebService
+    pdf = r.get("pdfUrl")
+    if pdf and pdf.lower().endswith(".pdf"):
+        return pdf
+    ftlist = (r.get("fullTextUrlList") or {}).get("fullTextUrl") or []
+    # Try styles and OA indicator
+    for item in ftlist:
+        u = item.get("url")
+        if not u:
+            continue
+        style = (item.get("documentStyle") or "").lower()
+        avail = (item.get("availability") or "").lower()
+        if u.lower().endswith(".pdf") or style == "pdf" or "open" in avail:
+            return u
+    return None
+
+def _eupmc_fetch_results(keywords: List[str], max_results: int, from_year: int) -> List[Dict[str, Any]]:
+    query = _eupmc_build_query(keywords, from_year)
+    page_size = 100
+    page = 1
+    out: List[Dict[str, Any]] = []
+
+    while len(out) < max_results:
+        params = {
+            "query": query,
+            "format": "json",
+            "pageSize": page_size,
+            "page": page,
+            "sort": "date_desc"
+        }
+        r = requests.get(EUROPE_PMC_SEARCH_URL, params=params, headers={"User-Agent": _UA}, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        results = ((data.get("resultList") or {}).get("result") or [])
+        if not results:
+            break
+        out.extend(results)
+        if len(results) < page_size:
+            break
+        page += 1
+        time.sleep(0.12)
+        if len(out) >= max_results:
+            out = out[:max_results]
+            break
+    return out
+
+def fetch_europepmc_pdfs(
+    keywords: List[str],
+    out_dir: str,
+    max_results: int = 2000,
+    from_year: int = 2000,
+) -> List[str]:
+    results = _eupmc_fetch_results(keywords, max_results=max_results, from_year=from_year)
+    entries: List[Dict[str, Any]] = []
+    seen = set()
+    for r in results:
+        pdf = _eupmc_extract_pdf_from_result(r)
+        if not pdf or pdf in seen:
+            continue
+        seen.add(pdf)
+        title = (r.get("title") or "paper").strip()
+        year = r.get("pubYear") or r.get("firstPublicationDate", "")[:4]
+        venue = (r.get("journalTitle") or r.get("bookOrReportDetails") or "").strip()
+        name = " - ".join([s for s in [title, venue, str(year or "")] if s])
+        entries.append({
+            "url": pdf,
+            "name": name,
+            "meta": {
+                "title": title,
+                "year": year,
+                "venue": venue,
+                "url": pdf,
+                "origin": "europe_pmc",
+            }
+        })
+    return parallel_download_pdfs(entries, out_dir, max_workers=16)
+
+# --------------------------------------------------------------------------------------
+# Optional: DOI resolver (allowlisted domains only, HEAD/GET to confirm PDF)
+# --------------------------------------------------------------------------------------
+
+def _domain_allowed(u: str) -> bool:
+    try:
+        from urllib.parse import urlparse
+        netloc = urlparse(u).netloc.lower()
+        return any(netloc.endswith(dom) for dom in PDF_DOMAIN_ALLOWLIST)
+    except Exception:
+        return False
+
+def try_resolve_doi_to_pdf(doi: str, timeout: int = 30) -> Optional[str]:
+    """
+    Try to resolve a DOI to a direct PDF on an allowlisted OA-friendly domain.
+    We first hit doi.org, then follow redirects; if content-type is PDF or URL endswith .pdf, accept.
+    """
+    try:
+        from urllib.parse import quote
+        url = f"https://doi.org/{quote(doi)}"
+        r = requests.get(url, headers={"User-Agent": _UA}, timeout=timeout, allow_redirects=True)
+        r.raise_for_status()
+        final_url = r.url
+        if not _domain_allowed(final_url):
+            return None
+        # Check content-type via HEAD (safer)
+        h = requests.head(final_url, headers={"User-Agent": _UA}, timeout=timeout, allow_redirects=True)
+        ctype = (h.headers.get("Content-Type") or "").lower()
+        if "pdf" in ctype or final_url.lower().endswith(".pdf"):
+            return final_url
+    except Exception:
+        return None
+    return None
 
 # --------------------------------------------------------------------------------------
 # Embeddings: E5 query/passage prefixing (optional)
@@ -392,7 +608,7 @@ class SmartHFEmbeddings(HuggingFaceEmbeddings):
         return super().embed_query(text)
 
 # --------------------------------------------------------------------------------------
-# Local Ensemble (RRF) — no langchain.retrievers import needed
+# Local Ensemble (RRF)
 # --------------------------------------------------------------------------------------
 
 class SimpleEnsembleRetriever:
@@ -410,7 +626,6 @@ class SimpleEnsembleRetriever:
         self.rrf_k = rrf_k  # standard RRF constant
 
     def _run_retriever(self, retriever, query: str):
-        # Try common APIs across LangChain versions, in a robust order.
         if hasattr(retriever, "get_relevant_documents"):
             return retriever.get_relevant_documents(query)
         if hasattr(retriever, "invoke"):
@@ -418,7 +633,6 @@ class SimpleEnsembleRetriever:
         if callable(retriever):
             return retriever(query)
         if hasattr(retriever, "_get_relevant_documents"):
-            # Older LC BM25 can require run_manager kw-only; handle both.
             try:
                 return retriever._get_relevant_documents(query, run_manager=None)
             except TypeError:
@@ -441,6 +655,7 @@ class SimpleEnsembleRetriever:
 
         def doc_key(doc):
             meta = getattr(doc, "metadata", {}) or {}
+            # DO NOT clobber 'source' (file path). Use it for dedup key.
             src = meta.get("source", "")
             page = str(meta.get("page", ""))
             text = (getattr(doc, "page_content", "") or "")[:500]
@@ -468,7 +683,8 @@ class SimpleEnsembleRetriever:
 
 def _attach_extra_metadata_from_manifest(docs: List[Any], manifest: Dict[str, Dict[str, Any]]) -> None:
     """
-    Enrich each Document's metadata using the download manifest (title, year, venue, url, source).
+    Enrich each Document's metadata using the download manifest (title, year, venue, url, origin).
+    We DO NOT overwrite metadata["source"] which holds the file path from loaders.
     """
     for d in docs:
         src_path = d.metadata.get("source", "")
@@ -476,14 +692,13 @@ def _attach_extra_metadata_from_manifest(docs: List[Any], manifest: Dict[str, Di
             continue
         rec = manifest.get(src_path)
         if not rec:
-            # Try to match by stem (sometimes loaders normalize path)
+            # Try to match by basename (loader may normalize)
             for k, v in manifest.items():
                 if os.path.basename(k) == os.path.basename(src_path):
                     rec = v
                     break
         if rec:
-            # Propagate useful metadata
-            for k in ("title", "year", "venue", "url", "source"):
+            for k in ("title", "year", "venue", "url", "origin"):
                 if k in rec:
                     d.metadata[k] = rec[k]
 
@@ -507,7 +722,6 @@ def _split_and_build_retriever(
     if not docs:
         raise RuntimeError("No PDF documents found to index.")
 
-    # Attach extra metadata (title/year/venue/url/source) from manifest
     manifest = _load_manifest(documents_dir)
     _attach_extra_metadata_from_manifest(docs, manifest)
 
@@ -519,10 +733,9 @@ def _split_and_build_retriever(
         separators=["\n\n", "\n", " ", ""],
     )
     documents = text_splitter.split_documents(docs)
-    # Drop tiny chunks
     documents = [d for d in documents if len(d.page_content or "") >= min_chunk_chars]
 
-    # BM25 (keyword) — give it slightly higher k than final fusion k
+    # BM25 (keyword) — slightly higher k than final fusion k
     bm25_retriever = BM25Retriever.from_documents(documents)
     bm25_retriever.k = max(k, 8)
 
@@ -534,7 +747,6 @@ def _split_and_build_retriever(
         if persist_dir:
             print(f"💾 Using Chroma (persist_dir={persist_dir})")
             vector_store = Chroma.from_documents(documents, embeddings, persist_directory=persist_dir)
-            # Chroma >= 0.4 auto-persists; guard for older versions
             try:
                 vector_store.persist()
             except Exception:
@@ -553,7 +765,7 @@ def _split_and_build_retriever(
 
     vector_retriever = vector_store.as_retriever(search_kwargs={"k": k})
 
-    # Local ensemble (RRF)
+    # Ensemble (RRF)
     ensemble_retriever = SimpleEnsembleRetriever(
         retrievers=[bm25_retriever, vector_retriever],
         weights=[0.45, 0.55],  # slight bias to semantic retrieval
@@ -562,10 +774,15 @@ def _split_and_build_retriever(
     print("✅ RAG knowledge base ready (Ensemble via local RRF).")
     return ensemble_retriever
 
+def _summarize_counts(tag: str, arxiv: int, openalex: int, eupmc: int, extra: int) -> str:
+    return (f"{tag} {arxiv + openalex + eupmc + extra} PDFs "
+            f"({arxiv} arXiv, {openalex} OpenAlex OA, {eupmc} Europe PMC, {extra} extra).")
+
 def build_retriever_from_web(
     polymer_keywords: Optional[List[str]] = None,
     max_arxiv: int = 300,
     max_openalex: int = 3000,
+    max_europepmc: int = 3000,
     from_year: int = 2010,
     extra_pdf_urls: Optional[List[str]] = None,
     persist_dir: str = DEFAULT_PERSIST_DIR,
@@ -574,41 +791,94 @@ def build_retriever_from_web(
     embedding_model: str = "sentence-transformers/all-mpnet-base-v2",
     vector_backend: str = "chroma",
     max_workers: int = 16,
+    try_doi_resolution: bool = False,
 ):
     """
     Build an extensive ensemble retriever by fetching polymer PDFs from:
       - OpenAlex OA (massive, keyless) with year floor
       - arXiv (keyless)
+      - Europe PMC (OA publisher/PMC PDFs)
       - optional direct URLs
+      - optional cautious DOI resolution (allowlisted OA domains)
     """
-    # Dedup and normalize keywords
     polymer_keywords = sorted(set(polymer_keywords or POLYMER_KEYWORDS), key=str.lower)
 
-    print("📡 Fetching polymer PDFs from the web (OpenAlex + arXiv)...")
+    print("📡 Fetching polymer PDFs from the web (OpenAlex + arXiv + Europe PMC)...")
     _ensure_dir(tmp_download_dir)
 
-    # OpenAlex first (largest yield)
+    # 1) OpenAlex (largest yield)
     openalex_paths = fetch_openalex_pdfs(
         polymer_keywords, out_dir=tmp_download_dir,
         max_results=max_openalex, per_page=200, from_year=from_year
     )
 
-    # arXiv
+    # 2) arXiv (keyless)
     arxiv_paths = fetch_arxiv_pdfs(
         polymer_keywords, out_dir=tmp_download_dir, max_results=max_arxiv
     )
 
-    # Extra direct URLs (if any)
+    # 3) Europe PMC (OA & PMC full text; includes many publisher OA PDFs, e.g., Nature Comms OA)
+    eupmc_paths = fetch_europepmc_pdfs(
+        polymer_keywords, out_dir=tmp_download_dir, max_results=max_europepmc, from_year=from_year
+    )
+
+    # 4) Extra direct URLs (if any)
     extra_paths: List[str] = []
     if extra_pdf_urls:
-        extra_entries = [{"url": u, "name": None, "meta": {"url": u, "source": "extra"}} for u in extra_pdf_urls]
+        extra_entries = [{"url": u, "name": None, "meta": {"url": u, "origin": "extra"}} for u in extra_pdf_urls]
         extra_paths = parallel_download_pdfs(extra_entries, tmp_download_dir, max_workers=max_workers)
 
-    total = len(openalex_paths) + len(arxiv_paths) + len(extra_paths)
-    print(f"✅ Downloaded {total} PDFs "
-          f"({len(arxiv_paths)} arXiv, {len(openalex_paths)} OpenAlex OA, {len(extra_paths)} extra).")
+    print("✅ " + _summarize_counts("Downloaded", len(arxiv_paths), len(openalex_paths), len(eupmc_paths), len(extra_paths)))
+    total = len(openalex_paths) + len(arxiv_paths) + len(eupmc_paths) + len(extra_paths)
+
+    # Optional DOI resolution on small keyword set if still low yield
+    if total == 0 and try_doi_resolution:
+        print("🔎 Trying cautious DOI resolution on allowlisted OA domains...")
+        # heuristics: pick a small Europe PMC run for DOIs
+        probe_results = _eupmc_fetch_results(["polymer"], max_results=50, from_year=max(2005, from_year - 5))
+        doi_entries = []
+        for r in probe_results:
+            doi = r.get("doi")
+            if not doi:
+                continue
+            pdf = try_resolve_doi_to_pdf(doi)
+            if pdf:
+                title = (r.get("title") or "paper").strip()
+                year = r.get("pubYear") or r.get("firstPublicationDate", "")[:4]
+                venue = (r.get("journalTitle") or "").strip()
+                name = " - ".join([s for s in [title, venue, str(year or "")] if s])
+                doi_entries.append({
+                    "url": pdf,
+                    "name": name,
+                    "meta": {"title": title, "year": year, "venue": venue, "url": pdf, "origin": "doi"}
+                })
+        doi_paths = parallel_download_pdfs(doi_entries, tmp_download_dir, max_workers=8)
+        total += len(doi_paths)
+        print(f"➕ DOI resolution fetched {len(doi_paths)} PDFs (allowlisted OA domains).")
+
     if total == 0:
-        raise RuntimeError("No PDFs fetched. Adjust keywords or add extra_pdf_urls.")
+        # Fallback pass: broaden queries automatically
+        print("⚠️  No PDFs on first pass. Broadening queries and relaxing filters...")
+        broad_kw = ["polymer"]
+        openalex_paths = fetch_openalex_pdfs(
+            broad_kw, out_dir=tmp_download_dir,
+            max_results=min(1000, max_openalex), per_page=200, from_year=max(2005, from_year - 5)
+        )
+        arxiv_paths = fetch_arxiv_pdfs(broad_kw, out_dir=tmp_download_dir, max_results=min(150, max_arxiv))
+        eupmc_paths = fetch_europepmc_pdfs(broad_kw, out_dir=tmp_download_dir, max_results=min(1000, max_europepmc), from_year=max(2005, from_year - 5))
+
+        print("🔁 " + _summarize_counts("Fallback fetched", len(arxiv_paths), len(openalex_paths), len(eupmc_paths), 0))
+        total = len(openalex_paths) + len(arxiv_paths) + len(eupmc_paths)
+
+        if total == 0:
+            raise RuntimeError(
+                "No PDFs fetched after fallback. Possible network egress block or API outage.\n"
+                "Quick checks:\n"
+                "  - Can you curl https://export.arxiv.org/api/query and https://api.openalex.org/works from this env?\n"
+                "  - Can you reach https://www.ebi.ac.uk/europepmc/webservices/rest/search ?\n"
+                "  - If running in a corporate cluster, allowlist those domains or set the HTTPS proxy.\n"
+                "  - You can also supply direct URLs via extra_pdf_urls=[...]."
+            )
 
     print("🧠 Building the knowledge base (BM25 + Vector)...")
     retriever = _split_and_build_retriever(
@@ -627,7 +897,7 @@ def build_retriever(
     embedding_model: str = "sentence-transformers/all-mpnet-base-v2",
     vector_backend: str = "chroma",
 ):
-    """Build from local PDFs (kept for compatibility)."""
+    """Build from local PDFs."""
     print("📚 Building RAG knowledge base from local PDFs...")
     return _split_and_build_retriever(
         documents_dir=papers_path,
@@ -655,6 +925,7 @@ def build_retriever_polymer_foundation_models(
         polymer_keywords=fm_kw,
         max_arxiv=400,
         max_openalex=4000,
+        max_europepmc=4000,
         from_year=from_year,
         persist_dir=persist_dir,
         k=k,
@@ -662,7 +933,7 @@ def build_retriever_polymer_foundation_models(
     )
 
 # --------------------------------------------------------------------------------------
-# CLI smoke (disabled by default, enable if you want a quick check)
+# CLI smoke (optional)
 # --------------------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -670,17 +941,20 @@ if __name__ == "__main__":
         polymer_keywords=POLYMER_KEYWORDS,
         max_arxiv=150,
         max_openalex=1500,
+        max_europepmc=2000,
         from_year=2010,
         persist_dir="chroma_polymer_db_big",
         k=6,
         embedding_model="intfloat/e5-large-v2",   # or "sentence-transformers/all-mpnet-base-v2"
         vector_backend="chroma",                  # or "faiss"
+        try_doi_resolution=False,                 # can set True if still zero-yield in locked envs
     )
     print("🔎 Sample query:")
     results = retriever.get_relevant_documents("PSMILES for polymer electrolyte design")
     for i, d in enumerate(results, 1):
         meta = d.metadata
-        src = meta.get("source", "unknown")
+        src_file = meta.get("source", "unknown-file")
         title = meta.get("title") or os.path.basename(meta.get("source", "")) or "document"
         year = meta.get("year", "")
-        print(f"[{i}] {title} ({year}) [{src}] :: {(d.page_content or '')[:180]}...")
+        origin = meta.get("origin", "")
+        print(f"[{i}] {title} ({year}) [{origin}] :: {os.path.basename(src_file)} :: {(d.page_content or '')[:180]}...")
