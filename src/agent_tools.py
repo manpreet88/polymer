@@ -7,10 +7,32 @@ from typing import Dict, Iterable, List
 
 import numpy as np
 
-from langchain.tools import tool
+try:
+    from langchain.tools import tool
+except ImportError:  # pragma: no cover - optional dependency
+    class _SimpleTool:
+        def __init__(self, func, name: str):
+            self.func = func
+            self.name = name
+            self.description = func.__doc__ or ""
 
-from Data_Modalities import AdvancedPolymerMultimodalExtractor
-from rag_pipeline import build_retriever
+        def __call__(self, *args, **kwargs):
+            return self.func(*args, **kwargs)
+
+        def run(self, *args, **kwargs):
+            if kwargs:
+                return self.func(**kwargs)
+            return self.func(*args)
+
+    def tool(arg=None):  # type: ignore
+        if callable(arg):
+            return _SimpleTool(arg, arg.__name__)
+
+        def decorator(func):
+            name = arg if isinstance(arg, str) else func.__name__
+            return _SimpleTool(func, name)
+
+        return decorator
 
 from .polymer_services import (
     PolymerSample,
@@ -22,7 +44,10 @@ from .polymer_services import (
 )
 
 _TOKENIZER = SimplePSMILESTokenizer(max_length=128)
-_MODEL = load_contrastive_model()
+try:
+    _MODEL = load_contrastive_model()
+except Exception as exc:  # pragma: no cover - optional dependency
+    _MODEL = exc  # type: ignore[assignment]
 _RAG_RETRIEVER = None
 
 
@@ -48,6 +73,12 @@ def _to_samples(records: Iterable[Dict]) -> List[PolymerSample]:
 def _ensure_retriever():
     global _RAG_RETRIEVER
     if _RAG_RETRIEVER is None:
+        try:
+            from rag_pipeline import build_retriever
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "Knowledge base retriever is unavailable. Install LangChain community integrations and chroma dependencies."
+            ) from exc
         guidelines_path = Path("Data/Guidelines")
         _RAG_RETRIEVER = build_retriever(papers_path=str(guidelines_path))
     return _RAG_RETRIEVER
@@ -65,6 +96,13 @@ def polymer_modality_processing_tool(csv_path: str, chunk_size: int = 500, num_w
         Path to the processed CSV ("*_processed.csv").
     """
 
+    try:
+        from Data_Modalities import AdvancedPolymerMultimodalExtractor
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "AdvancedPolymerMultimodalExtractor is unavailable. Ensure RDKit and its dependencies are installed."
+        ) from exc
+
     extractor = AdvancedPolymerMultimodalExtractor(csv_path)
     extractor.process_all_polymers_parallel(chunk_size=chunk_size, num_workers=num_workers)
     processed = Path(csv_path).with_name(Path(csv_path).stem + "_processed.csv")
@@ -81,6 +119,10 @@ def contrastive_embedding_tool(samples_path: str) -> Dict[str, List[float]]:
 
     records = _load_jsonl(Path(samples_path))
     samples = _to_samples(records)
+    if isinstance(_MODEL, Exception):
+        raise RuntimeError(
+            "Contrastive encoder is unavailable. Install the required deep learning dependencies."
+        ) from _MODEL
     embeddings = encode_polymers(samples, _TOKENIZER, _MODEL)
     combined = combine_modal_embeddings(embeddings)
     if combined.shape[0] != len(samples):
@@ -111,6 +153,10 @@ def polymer_property_prediction_tool(dataset_path: str, target_key: str, train_f
             raise KeyError(f"Target key '{target_key}' missing from record {record}")
         targets.append(float(record[target_key]))
     y = np.array(targets, dtype=np.float32)
+    if isinstance(_MODEL, Exception):
+        raise RuntimeError(
+            "Contrastive encoder is unavailable. Install the required deep learning dependencies."
+        ) from _MODEL
     embeddings = encode_polymers(samples, _TOKENIZER, _MODEL)
     x = combine_modal_embeddings(embeddings)
     n_train = max(1, int(len(samples) * train_fraction))
@@ -149,6 +195,10 @@ def polymer_generation_tool(seed_path: str, library_path: str, top_k: int = 5) -
     library_records = _load_jsonl(Path(library_path))
     library_samples = _to_samples(library_records)
 
+    if isinstance(_MODEL, Exception):
+        raise RuntimeError(
+            "Contrastive encoder is unavailable. Install the required deep learning dependencies."
+        ) from _MODEL
     seed_emb = combine_modal_embeddings(encode_polymers([seed_sample], _TOKENIZER, _MODEL))
     library_emb = combine_modal_embeddings(encode_polymers(library_samples, _TOKENIZER, _MODEL))
 
