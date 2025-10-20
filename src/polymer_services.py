@@ -9,15 +9,26 @@ from typing import Dict, Iterable, List, Optional
 import numpy as np
 import torch
 
-from .multimodal_components import (
-    FingerprintEncoder,
-    GineEncoder,
-    LoadedMultimodalModel,
-    MultimodalContrastiveModel,
-    NodeSchNetWrapper,
-    PSMILESDebertaEncoder,
-    FP_LENGTH,
-)
+try:
+    from .multimodal_components import (
+        FingerprintEncoder,
+        GineEncoder,
+        LoadedMultimodalModel,
+        MultimodalContrastiveModel,
+        NodeSchNetWrapper,
+        PSMILESDebertaEncoder,
+        FP_LENGTH,
+    )
+    _MULTIMODAL_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - optional heavyweight deps
+    FingerprintEncoder = None  # type: ignore
+    GineEncoder = None  # type: ignore
+    LoadedMultimodalModel = None  # type: ignore
+    MultimodalContrastiveModel = None  # type: ignore
+    NodeSchNetWrapper = None  # type: ignore
+    PSMILESDebertaEncoder = None  # type: ignore
+    FP_LENGTH = 2048  # sensible default to keep tokenizer usable
+    _MULTIMODAL_IMPORT_ERROR = exc
 
 
 class SimplePSMILESTokenizer:
@@ -258,6 +269,11 @@ def load_contrastive_model(
     device: Optional[str] = None,
 ) -> LoadedMultimodalModel:
     """Instantiate :class:`MultimodalContrastiveModel` and load available weights."""
+
+    if _MULTIMODAL_IMPORT_ERROR is not None or MultimodalContrastiveModel is None:
+        raise RuntimeError(
+            "Multimodal encoder components are unavailable. Install transformers/torch geometric dependencies."
+        ) from _MULTIMODAL_IMPORT_ERROR
 
     device_t = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
